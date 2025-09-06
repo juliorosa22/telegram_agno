@@ -15,6 +15,8 @@ load_dotenv()
 
 # Conversation states for registration
 REGISTER_EMAIL, REGISTER_NAME, REGISTER_LASTNAME, REGISTER_CONFIRM = range(4)
+# Add new conversation state
+START_EMAIL = 1
 
 class AgnoTelegramBot:
     """Telegram bot with session-based authentication"""
@@ -50,6 +52,16 @@ class AgnoTelegramBot:
             fallbacks=[CommandHandler("cancel", self.register_cancel)],
         )
         self.app.add_handler(registration_handler)
+        
+        # NEW: Add /start conversation for email input
+        start_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", self.start_command)],
+            states={
+                START_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.start_email)],
+            },
+            fallbacks=[CommandHandler("cancel", self.start_cancel)],
+        )
+        self.app.add_handler(start_handler)
         
         # Command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
@@ -259,12 +271,52 @@ class AgnoTelegramBot:
         return ConversationHandler.END
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command with authentication check"""
+        """Handle /start command with authentication check and email prompt"""
         user = update.effective_user
         args = context.args
         
         print(f"👤 /start command from {user.first_name} ({user.id})")
         
+        # Check authentication
+        auth_result = await self.check_authentication(str(user.id))
+        if auth_result["authenticated"]:
+            # Already authenticated - proceed normally
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{self.api_url}/api/v1/start",
+                        json={
+                            "user_id": str(user.id),
+                            "user_data": user.to_dict(),
+                            "args": args
+                        }
+                    ) as response:
+                        result = await response.json()
+                        await update.message.reply_text(result["message"], parse_mode='Markdown', disable_web_page_preview=True)
+            except Exception as e:
+                print(f"❌ Error in start command: {e}")
+                await update.message.reply_text("❌ Welcome! There was an issue connecting to the service.")
+            return ConversationHandler.END
+        
+        # NEW: Not authenticated - prompt for email
+        await update.message.reply_text(
+            "👋 Welcome! To get started, please provide your email address (used for your existing account):\n\n"
+            "📧 *Enter your email:* (or type /cancel to stop)",
+            parse_mode='Markdown'
+        )
+        return START_EMAIL
+    
+    async def start_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle email input for direct auth"""
+        email = update.message.text.strip()
+        user = update.effective_user
+        
+        # Basic validation
+        if "@" not in email or "." not in email:
+            await update.message.reply_text("❌ Please enter a valid email address.")
+            return START_EMAIL
+        
+        # Send to API with email for auth
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -272,26 +324,22 @@ class AgnoTelegramBot:
                     json={
                         "user_id": str(user.id),
                         "user_data": user.to_dict(),
-                        "args": args
+                        "email": email  # NEW: Pass email
                     }
                 ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        await update.message.reply_text(
-                            result["message"], 
-                            parse_mode='Markdown', 
-                            disable_web_page_preview=True
-                        )
-                    else:
-                        await update.message.reply_text(
-                            "❌ Sorry, I'm having trouble right now. Please try again later."
-                        )
+                    result = await response.json()
+                    await update.message.reply_text(result["message"], parse_mode='Markdown', disable_web_page_preview=True)
         except Exception as e:
-            print(f"❌ Error in start command: {e}")
-            await update.message.reply_text(
-                "❌ Welcome! There was an issue connecting to the service, but you can try again."
-            )
+            print(f"❌ Error in email auth: {e}")
+            await update.message.reply_text("❌ Sorry, there was an issue. Try /register instead.")
+        
+        return ConversationHandler.END
     
+    async def start_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Cancel /start email input"""
+        await update.message.reply_text("❌ Cancelled. Type /start to try again or /register to create an account.")
+        return ConversationHandler.END
+
     async def profile_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /profile command"""
         user = update.effective_user

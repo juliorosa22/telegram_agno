@@ -128,6 +128,7 @@ class SupabaseClient:
             print(f"❌ Error ensuring user exists: {e}")
             return {"success": False, "message": "❌ Internal error. Please try again later."}
 
+    #adjust this function to also get the user name and insert it into the database
     async def link_telegram_user(self, supabase_user_id: str, telegram_id: str):
         """Link a Telegram user to a Supabase user"""
         try:

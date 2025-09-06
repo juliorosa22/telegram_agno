@@ -1,13 +1,28 @@
 from fastapi import FastAPI, HTTPException, File, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 import uvicorn
 import os
 import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Import standardized messages
+from messages import MESSAGES
+
+# Import models
+from models import (
+    MessageRequest,
+    TransactionResponse,
+    ReminderResponse,
+    SummaryRequest,
+    StartRequest,
+    UserCheckRequest,
+    RegisterRequest,
+    AuthCheckRequest
+)
 
 # Load environment
 load_dotenv()
@@ -92,54 +107,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models for API
-class MessageRequest(BaseModel):
-    user_id: str
-    message: str
-    user_data: Optional[Dict[str, Any]] = {}
-
-class TransactionResponse(BaseModel):
-    success: bool
-    message: str
-    transaction_id: Optional[str] = None
-    amount: Optional[float] = None
-    category: Optional[str] = None
-
-class ReminderResponse(BaseModel):
-    success: bool
-    message: str
-    reminder_id: Optional[str] = None
-
-class SummaryRequest(BaseModel):
-    user_id: str
-    days: int = 30
-
-class StartRequest(BaseModel):
-    user_id: str
-    user_data: Dict[str, Any]
-    args: Optional[List[str]] = None
-
-class UserCheckRequest(BaseModel):
-    telegram_id: str
-    user_data: Dict[str, Any]
-
-class RegisterRequest(BaseModel):
-    telegram_id: str
-    email: str
-    first_name: str
-    last_name: Optional[str] = None
-    language_code: str = "en"
-
-class AuthCheckRequest(BaseModel):
-    telegram_id: str
-
 # API Endpoints
+
 @app.post("/api/v1/start")
+
 async def handle_start(request: StartRequest):
     """Handle /start command with authentication handling"""
     try:
         if not main_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
+
+        # NEW: Handle email-based auth if provided and not authenticated
+        if request.email and not session_manager.is_authenticated(request.user_id):
+            # Attempt auth via email
+            auth_user = await supabase_client.get_user_by_email_auth(request.email)
+            if auth_user:
+                # Link Telegram and create session
+                await supabase_client.link_telegram_to_auth_user(auth_user['user_id'], request.user_id, request.user_data)
+                user_data = {
+                    'user_id': auth_user['user_id'],
+                    'email': request.email,
+                    'first_name': auth_user.get('user_metadata', {}).get('first_name', request.user_data.get('first_name')),
+                    'authenticated': True
+                }
+                session_manager.create_session(request.user_id, user_data)
+                return {
+                    "success": True,
+                    "message": MESSAGES["welcome_authenticated"].format(first_name=user_data.get("first_name", "there"))
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "❌ Email not found. Please use /register to create an account."
+                }
 
         # This handle when the user has been redirected from the APP
         if request.args:
@@ -147,35 +147,42 @@ async def handle_start(request: StartRequest):
                 # Check if user is authenticated for premium linking
                 user_data = await require_authentication(request.user_id)
                 
-                # Handle premium user linking
+                # NEW: Check if already linked to prevent redundant linking
                 supabase_user_id = request.args[0]
-                await supabase_client.link_telegram_user(supabase_user_id, request.user_id)
+                existing_link = await supabase_client.get_user_by_telegram_id_auth(request.user_id)
+                if existing_link and existing_link.get('user_id') == supabase_user_id:
+                    # Already linked - skip linking and proceed to premium check
+                    pass  # Proceed below
+                else:
+                    # Not linked - perform linking
+                    await supabase_client.link_telegram_user(supabase_user_id, request.user_id)
                 
-                # Generate PayPal payment link
-                paypal_url = f"https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=YOUR_BUTTON_ID&custom={supabase_user_id}"
-                
-                return {
-                    "success": True,
-                    "message": (
-                        "🎉 *Welcome to OkanFit Personal Tracker!*\n\n"
-                        "To unlock premium AI features, complete your payment:\n"
-                        f"💳 [Pay with PayPal]({paypal_url})\n\n"
-                        "After payment, you'll have access to:\n"
-                        "🤖 AI-powered expense tracking\n"
-                        "📊 Smart financial insights\n"
-                        "⏰ Intelligent reminders\n"
-                        "📈 Advanced analytics"
-                    )
-                }
+                # Check premium status before generating payment link
+                is_premium = await supabase_client.check_premium_status(supabase_user_id)
+                if is_premium:
+                    return {
+                        "success": True,
+                        "message": MESSAGES["welcome_authenticated"].format(first_name=user_data.get("first_name", "there"))
+                    }
+                else:
+                    # Not premium - get credits and send payment link with credit info
+                    credit_info = await supabase_client.database.get_user_credits(supabase_user_id)
+                    credits_remaining = credit_info.get('credits', 0)
+                    paypal_url = f"https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=YOUR_BUTTON_ID&custom={supabase_user_id}"
+                    
+                    message = MESSAGES["welcome_premium"].format(paypal_url=paypal_url)
+                    message += f"\n\n💳 You have {credits_remaining} credits remaining for freemium features."
+                    
+                    return {
+                        "success": True,
+                        "message": message
+                    }
             except HTTPException as e:
                 if e.status_code == 401:
                     # User not authenticated for premium linking
                     return {
                         "success": True,
-                        "message": (
-                            "🔐 You need to register first to link premium features.\n\n"
-                            "Type /register to create your account, then try again."
-                        )
+                        "message": MESSAGES["need_register_premium"]
                     }
                 raise e
         
@@ -188,21 +195,7 @@ async def handle_start(request: StartRequest):
             first_name = user_data.get("first_name", request.user_data.get("first_name", "there"))
             return {
                 "success": True,
-                "message": (
-                    f"👋 *Hello {first_name}!*\n\n"
-                    "I'm your AI financial assistant powered by Agno. I can help you:\n\n"
-                    "💰 *Track expenses and income*\n"
-                    "📸 *Process receipt photos*\n"
-                    "📄 *Import bank statements*\n"
-                    "⏰ *Manage reminders*\n"
-                    "📊 *View financial summaries*\n\n"
-                    "*Just send me messages like:*\n"
-                    "• 'Spent $50 on groceries'\n"
-                    "• 'Remind me to pay rent tomorrow'\n"
-                    "• 'Show my expenses this month'\n"
-                    "• Send a photo of your receipt\n\n"
-                    "Type /help for more examples!"
-                )
+                "message": MESSAGES["welcome_authenticated"].format(first_name=first_name)
             }
             
         except HTTPException as e:
@@ -210,17 +203,7 @@ async def handle_start(request: StartRequest):
                 # User not authenticated - show registration prompt
                 return {
                     "success": True,
-                    "message": (
-                        "👋 *Welcome to OkanFit Personal Tracker!*\n\n"
-                        "🤖 I'm your personal financial assistant powered by AI.\n\n"
-                        "🔐 To get started, please register your account:\n"
-                        "Type /register to create your account\n\n"
-                        "✨ After registration, you can:\n"
-                        "💰 Track expenses with natural language\n"
-                        "📸 Process receipt photos automatically\n"
-                        "⏰ Set smart reminders\n"
-                        "📊 Get financial insights"
-                    )
+                    "message": MESSAGES["welcome_unauthenticated"]
                 }
             raise e
         
@@ -233,51 +216,7 @@ async def handle_help():
     """Handle /help command - No authentication required"""
     try:
         # Help is available to everyone, no authentication needed
-        help_message = """
-🤖 *OkanFit Personal Tracker - Agno Powered*
-
-*💰 Expense Tracking:*
-• "Spent $25 on lunch at McDonald's"
-• "Paid $1200 rent"
-• "Bought groceries for $85"
-• 📸 Send receipt photos for automatic processing
-
-*💵 Income Tracking:*
-• "Received $3000 salary"
-• "Got $50 freelance payment"
-• "Earned $200 from side project"
-
-*⏰ Reminders:*
-• "Remind me to pay bills tomorrow at 3pm"
-• "Set reminder: doctor appointment next Friday"
-• "Don't forget to call mom this weekend"
-
-*📊 Financial Views:*
-• /balance - View financial summary
-• /reminders - Show pending reminders
-• "Show expenses this week"
-• "What's my spending pattern?"
-
-*📄 Document Processing:*
-• Send PDF bank statements for bulk import
-• Receipt photos are automatically processed
-• Invoices and bills can be analyzed
-
-*🎯 Commands:*
-/start - Get started
-/register - Create your account
-/help - Show this help
-/balance - Financial summary
-/reminders - View reminders
-
-*🔐 Authentication Required:*
-Most features require registration. Use /register to get started!
-
-*Powered by Agno Framework with GPT-4 Vision*
-Just talk to me naturally - I understand! 🎉
-        """
-        
-        return {"success": True, "message": help_message}
+        return {"success": True, "message": MESSAGES["help_message"]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -288,14 +227,9 @@ async def route_message(request: MessageRequest):
         if not main_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # Require authentication before processing ANY message
-        user_data = await require_authentication(request.user_id)
-        
-        # Check and consume credits for text message processing (1 credit)
-        credit_result = await check_and_consume_credits(
-            request.user_id, 
-            'text_message', 
-            1
+        # REPLACED: Use the new helper for auth and credits
+        user_data, credit_result = await authenticate_and_check_credits(
+            request.user_id, 'text_message', 1
         )
         
         # Process the message
@@ -304,12 +238,9 @@ async def route_message(request: MessageRequest):
         # Add credit info to response if not premium
         if not credit_result.get('is_premium', False):
             credits_remaining = credit_result.get('credits_remaining', 0)
-            
-            # Add credit warning if low
-            if credits_remaining <= 5:
-                result += f"\n\n💳 **Credits remaining: {credits_remaining}**"
-                if credits_remaining <= 1:
-                    result += "\n🚨 Almost out of credits! Type /upgrade for unlimited usage."
+            result += MESSAGES["credit_warning"].format(credits_remaining=credits_remaining)
+            if credits_remaining <= 1:
+                result += MESSAGES["credit_low"]
         
         return {"success": True, "message": result}
         
@@ -330,14 +261,9 @@ async def process_receipt(user_id: str, file: UploadFile = File(...)):
         if not transaction_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # Require authentication before processing
-        await require_authentication(user_id)
-        
-        # Check and consume credits for receipt processing (5 credits)
-        credit_result = await check_and_consume_credits(
-            user_id, 
-            'receipt_processing', 
-            5
+        # REPLACED: Use the new helper for auth and credits
+        user_data, credit_result = await authenticate_and_check_credits(
+            user_id, 'receipt_processing', 5
         )
         
         # Save uploaded file temporarily
@@ -354,7 +280,7 @@ async def process_receipt(user_id: str, file: UploadFile = File(...)):
         # Add credit info to response if not premium
         if not credit_result.get('is_premium', False):
             credits_remaining = credit_result.get('credits_remaining', 0)
-            result += f"\n\n💳 Credits remaining: {credits_remaining}"
+            result += MESSAGES["credits_remaining"].format(credits_remaining=credits_remaining)
         
         return TransactionResponse(success=True, message=result)
         
@@ -378,8 +304,8 @@ async def process_bank_statement(user_id: str, file: UploadFile = File(...)):
         if not transaction_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # Require authentication before processing
-        await require_authentication(user_id)
+        # REPLACED: Use the new helper (no credits needed for this endpoint, so pass 0)
+        user_data, _ = await authenticate_and_check_credits(user_id, 'bank_statement', 0)
         
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
@@ -413,8 +339,8 @@ async def get_transaction_summary(request: SummaryRequest):
         if not transaction_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # Require authentication before processing
-        await require_authentication(request.user_id)
+        # UPDATED: Use the new helper for auth (no credits needed, so pass 0)
+        user_data, _ = await authenticate_and_check_credits(request.user_id, 'summary', 0)
         
         result = await transaction_agent.get_summary(request.user_id, request.days)
         return {"success": True, "message": result}
@@ -432,8 +358,8 @@ async def get_reminders(user_id: str, limit: int = 10):
         if not reminder_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # Require authentication before processing
-        await require_authentication(user_id)
+        # UPDATED: Use the new helper for auth (no credits needed, so pass 0)
+        user_data, _ = await authenticate_and_check_credits(user_id, 'reminders', 0)
         
         result = await reminder_agent.get_reminders(user_id, limit)
         return {"success": True, "message": result}
@@ -450,18 +376,29 @@ async def require_authentication(telegram_id: str) -> Dict[str, Any]:
     if not session_manager.is_authenticated(telegram_id):
         # Try to authenticate from database via Supabase Auth
         user_result = await supabase_client.ensure_user_exists_auth(telegram_id, {})
-        #print(f"inside require auth:{user_result}")
         if not user_result.get("success", False) or not user_result.get("authenticated", False):
-            #print("AQUIII correto")
-            error_message = user_result.get("message", "User not registered. Please use /register command first.")
-            raise HTTPException(status_code=401, detail=error_message)
-        #print("veio parar aqui")        
+            raise HTTPException(status_code=401, detail=MESSAGES["user_not_registered"])
         # Create session with authenticated user data
         user_data = user_result["user_data"]
         session_manager.create_session(telegram_id, user_data)
         return user_data
     
     return session_manager.get_session(telegram_id)
+
+# NEW: Reusable helper for authentication and credit checking
+async def authenticate_and_check_credits(user_id: str, operation_type: str, credits_needed: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Unified function for authentication and credit consumption.
+    Returns (user_data, credit_result).
+    Raises HTTPException on failure.
+    """
+    # Step 1: Authenticate user
+    user_data = await require_authentication(user_id)
+    
+    # Step 2: Check and consume credits
+    credit_result = await check_and_consume_credits(user_id, operation_type, credits_needed)
+    
+    return user_data, credit_result
 
 @app.post("/api/v1/register")
 async def register_user(request: RegisterRequest):
@@ -475,7 +412,7 @@ async def register_user(request: RegisterRequest):
         if existing_user and existing_user.get('authenticated', False):
             return {
                 "success": False, 
-                "message": f"❌ This Telegram account is already registered with email: {existing_user.get('email', 'unknown')}"
+                "message": MESSAGES["telegram_already_registered"].format(email=existing_user.get('email', 'unknown'))
             }
         
         # Check if email already exists in Supabase Auth
@@ -511,13 +448,13 @@ async def register_user(request: RegisterRequest):
                 
                 return {
                     "success": True,
-                    "message": f"✅ Telegram account linked to existing email! Welcome back {request.first_name}!",
+                    "message": MESSAGES["link_success"].format(first_name=request.first_name),
                     "user_data": user_data
                 }
             else:
                 return {
                     "success": False,
-                    "message": "❌ Failed to link accounts. Please contact support."
+                    "message": MESSAGES["link_failed"]
                 }
         
         # Create new user in Supabase Auth
@@ -536,7 +473,7 @@ async def register_user(request: RegisterRequest):
         if not auth_result['success']:
             return {
                 "success": False,
-                "message": f"❌ Registration failed: {auth_result['message']}"
+                "message": MESSAGES["registration_failed"].format(message=auth_result['message'])
             }
         
         # Link Telegram ID to the new auth user
@@ -569,13 +506,13 @@ async def register_user(request: RegisterRequest):
             
             return {
                 "success": True,
-                "message": f"✅ Registration successful! Welcome {request.first_name}!\n\n💡 You can manage your account at the Supabase dashboard.",
+                "message": MESSAGES["registration_success"].format(first_name=request.first_name),
                 "user_data": user_data
             }
         else:
             return {
                 "success": False,
-                "message": "❌ Registration failed during account linking. Please try again."
+                "message": MESSAGES["registration_linking_failed"]
             }
             
     except Exception as e:
@@ -636,17 +573,9 @@ async def check_and_consume_credits(user_id: str, operation_type: str, credits_n
             credits_available = result.get('credits_available', 0)
             credits_needed = result.get('credits_needed', 0)
             
-            error_msg = (
-                f"❌ **Insufficient Credits**\n\n"
-                f"💳 Available: {credits_available} credits\n"
-                f"🔧 Needed: {credits_needed} credits\n\n"
-                f"🎯 **Upgrade to Premium for unlimited usage!**\n"
-                f"💎 Premium includes:\n"
-                f"• ♾️ Unlimited AI processing\n"
-                f"• 📊 Advanced analytics\n"
-                f"• 🔄 Priority support\n"
-                f"• 📱 Cross-platform sync\n\n"
-                f"Type /upgrade to get premium access!"
+            error_msg = MESSAGES["insufficient_credits"].format(
+                credits_available=credits_available,
+                credits_needed=credits_needed
             )
             
             raise HTTPException(status_code=402, detail=error_msg)  # 402 Payment Required
