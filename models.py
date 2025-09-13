@@ -41,3 +41,7 @@ class RegisterRequest(BaseModel):
 
 class AuthCheckRequest(BaseModel):
     telegram_id: str
+    user_name: Optional[str] = None
+    supabase_user_id: Optional[str] = None
+
+

@@ -1,11 +1,12 @@
 from typing import Dict, Any, List, Optional
-from .simple_database import Database
+from .database import Database
 from .models import Transaction, Reminder, TransactionType, ReminderType, Priority
 from datetime import datetime, timedelta
 import os
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
 from gotrue.errors import AuthApiError
+import json
 
 
 class SupabaseClient:
@@ -129,23 +130,24 @@ class SupabaseClient:
             return {"success": False, "message": "❌ Internal error. Please try again later."}
 
     #adjust this function to also get the user name and insert it into the database
-    async def link_telegram_user(self, supabase_user_id: str, telegram_id: str):
+    async def link_telegram_user(self, supabase_user_id: str, telegram_id: str, user_name: str ):
         """Link a Telegram user to a Supabase user"""
         try:
             if not self.connected:
                 await self.connect()
-                
+            
             # Update user_settings with telegram_id
             async with self.database.pool.acquire() as conn:
                 await conn.execute("""
-                    INSERT INTO user_settings (user_id, telegram_id, last_bot_interaction)
-                    VALUES ($1, $2, NOW())
+                    INSERT INTO user_settings (user_id, telegram_id, name, last_bot_interaction)
+                    VALUES ($1, $2, $3, NOW())
                     ON CONFLICT (user_id) DO UPDATE SET
                         telegram_id = $2,
+                        name = $3,
                         last_bot_interaction = NOW(),
                         updated_at = NOW()
-                """, supabase_user_id, telegram_id)
-                
+                """, supabase_user_id, telegram_id, user_name)
+                print(f"inserted {user_name}")
                 print(f"✅ Linked Telegram user {telegram_id} to Supabase user {supabase_user_id}")
                 
         except Exception as e:
@@ -360,8 +362,8 @@ class SupabaseClient:
             async with self.database.pool.acquire() as conn:
                 # Get user_id from user_settings
                 user_row = await conn.fetchrow("""
-                    SELECT user_id, currency, language, timezone, is_premium, premium_until
-                    FROM user_settings 
+                    SELECT user_id, currency, name, language, timezone, is_premium, premium_until, freemium_credits
+                    FROM user_settings
                     WHERE telegram_id = $1
                 """, telegram_id)
                 
@@ -379,13 +381,13 @@ class SupabaseClient:
                         return {
                             'user_id': auth_user_id,
                             'email': auth_response.user.email,
-                            'first_name': auth_response.user.user_metadata.get('first_name'),
-                            'last_name': auth_response.user.user_metadata.get('last_name'),
+                            'first_name': auth_response.user.user_metadata.get('name'),
                             'currency': user_row['currency'],
                             'language': user_row['language'],
                             'timezone': user_row['timezone'],
                             'is_premium': user_row['is_premium'],
                             'premium_until': user_row['premium_until'],
+                            'freemium_credits': user_row['freemium_credits'],
                             'telegram_id': telegram_id,
                             'authenticated': True
                         }
@@ -396,12 +398,12 @@ class SupabaseClient:
                         'user_id': auth_user_id,
                         'email': None,
                         'first_name': None,
-                        'last_name': None,
                         'currency': user_row['currency'],
                         'language': user_row['language'],
                         'timezone': user_row['timezone'],
                         'is_premium': user_row['is_premium'],
                         'premium_until': user_row['premium_until'],
+                        'freemium_credits': 0,
                         'telegram_id': telegram_id,
                         'authenticated': False  # Not authenticated if can't get auth data
                     }
@@ -496,3 +498,89 @@ class SupabaseClient:
         except Exception as e:
             print(f"❌ Error ensuring user exists: {e}")
             return {"success": False, "message": "❌ Internal error. Please try again later."}
+
+    async def check_user_by_baseid(self, supabase_user_id: str) -> bool:
+        """Check if user exists in Supabase Auth by user ID"""
+        try:
+            # Attempt to get user by ID from Supabase Auth
+            auth_response = self.supabase.auth.admin.get_user_by_id(supabase_user_id)
+            
+            if auth_response.user:
+                return True
+            else:
+                return False
+            
+        except Exception as e:
+            print(f"❌ Error checking user by base ID: {e}")
+            return False
+
+    async def consume_credits(self, user_id: str, operation_type: str, credits_needed: int, activity_data: dict = None) -> dict:
+        """Consume freemium credits for an operation"""
+        async with self.database.pool.acquire() as conn:
+            result = await conn.fetchrow("""
+                SELECT consume_freemium_credits($1, $2, $3, $4) as result
+            """, user_id, operation_type, credits_needed, json.dumps(activity_data or {}))
+            
+            return json.loads(result['result'])
+    
+    async def get_user_credits(self, user_id: str) -> dict:
+        """Get user's current credit status"""
+        if not self.connected:
+            await self.connect()
+        
+        async with self.database.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT freemium_credits, is_premium, credits_reset_date, premium_until
+                FROM user_settings 
+                WHERE user_id = $1
+            """, user_id)
+            
+            if not row:
+                return {"credits": 0, "is_premium": False, "error": "User not found"}
+            
+            return {
+                "credits": row['freemium_credits'],
+                "is_premium": row['is_premium'],
+                "credits_reset_date": row['credits_reset_date'],
+                "premium_until": row['premium_until']
+            }
+
+    async def reset_monthly_credits(self) -> int:
+        """Reset monthly credits for all eligible users"""
+        if not self.connected:
+            await self.connect()
+        
+        async with self.database.pool.acquire() as conn:
+            result = await conn.fetchval("SELECT reset_monthly_credits()")
+            return result
+
+    async def ensure_user_exists(self, user_id: str, user_data: dict = None):
+        """Ensure user exists in user_settings table"""
+        if not self.connected:
+            await self.connect()
+        
+        async with self.database.pool.acquire() as conn:
+            # Check if user exists
+            existing_user = await conn.fetchrow(
+                "SELECT user_id FROM user_settings WHERE user_id = $1", 
+                user_id
+            )
+            
+            if not existing_user:
+                # Create new user with defaults
+                await conn.execute("""
+                    INSERT INTO user_settings (
+                        user_id, name, currency, language, timezone
+                    ) VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (user_id) DO NOTHING
+                """, 
+                user_id, 
+                user_data.get("name", "") if user_data else "",
+                user_data.get("currency", "USD") if user_data else "USD",
+                user_data.get("language", "en") if user_data else "en",
+                user_data.get("timezone", "UTC") if user_data else "UTC"
+                )
+                
+                print(f"✅ Created user settings for user ID: {user_id}")
+            else:
+                print(f"✅ User {user_id} already exists")

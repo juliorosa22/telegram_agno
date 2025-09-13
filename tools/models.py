@@ -241,6 +241,8 @@ class UserSettings:
     is_premium: bool = False
     telegram_id: Optional[str] = None
     premium_until: Optional[datetime] = None
+    freemium_credits: Optional[int] = None
+    credits_reset_date: Optional[datetime] = None
     last_bot_interaction: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -254,6 +256,8 @@ class UserSettings:
             "is_premium": self.is_premium,
             "telegram_id": self.telegram_id,
             "premium_until": self.premium_until.isoformat() if self.premium_until else None,
+            "freemium_credits": self.freemium_credits,
+            "credits_reset_date": self.credits_reset_date.isoformat() if self.credits_reset_date else None,
             "last_bot_interaction": self.last_bot_interaction.isoformat() if self.last_bot_interaction else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -267,6 +271,15 @@ class UserSettings:
             return True  # Lifetime premium
         return datetime.now() < self.premium_until
     
+    def has_credits(self) -> bool:
+        """Check if user has freemium credits available"""
+        if self.freemium_credits is None:
+            return False
+        if self.credits_reset_date and datetime.now() >= self.credits_reset_date:
+            return True  # Credits should be reset
+        return self.freemium_credits > 0
+    
+
     def get_premium_status(self) -> str:
         """Get human-readable premium status"""
         if not self.is_premium:

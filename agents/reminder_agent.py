@@ -3,7 +3,8 @@ import re
 import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
-
+import asyncio  # <-- 1. IMPORT ASYNCIO
+from agno.models.groq import Groq
 # Fix: Use package imports from __init__.py
 from tools import Reminder, ReminderType, Priority
 
@@ -59,8 +60,10 @@ class ReminderAgent:
             - "Pay rent deadline is 1st of month" -> priority: "urgent", type: "deadline"
             """
             
-            response = await self.agent.run(extraction_prompt)
-            
+            # --- 2. APPLY THE FIX HERE ---
+            response_obj = await asyncio.to_thread(self.agent.run, extraction_prompt)
+            response = str(response_obj)
+
             # Parse the JSON response
             try:
                 data = json.loads(response)

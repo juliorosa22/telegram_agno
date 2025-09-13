@@ -1,7 +1,7 @@
 """Core application components"""
 
 #from .database import Database
-from .simple_database import Database
+from .database import Database
 from .models import (
     Transaction, 
     Reminder, 

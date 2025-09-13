@@ -813,44 +813,7 @@ class Database:
                 'updated_at': row['updated_at']
             }
 
-    # ============================================================================
-    # FREEMIUM CREDIT OPERATIONS (Simplified)
-    # ============================================================================
-
-    async def consume_credits(self, user_id: str, operation_type: str, credits_needed: int, activity_data: dict = None) -> dict:
-        """Consume freemium credits for an operation"""
-        async with self.pool.acquire() as conn:
-            result = await conn.fetchrow("""
-                SELECT consume_freemium_credits($1, $2, $3, $4) as result
-            """, user_id, operation_type, credits_needed, json.dumps(activity_data or {}))
-            
-            return json.loads(result['result'])
-
-    async def get_user_credits(self, user_id: str) -> dict:
-        """Get user's current credit status"""
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                SELECT freemium_credits, is_premium, credits_reset_date, premium_until
-                FROM user_settings 
-                WHERE user_id = $1
-            """, user_id)
-            
-            if not row:
-                return {"credits": 0, "is_premium": False, "error": "User not found"}
-            
-            return {
-                "credits": row['freemium_credits'],
-                "is_premium": row['is_premium'],
-                "credits_reset_date": row['credits_reset_date'],
-                "premium_until": row['premium_until']
-            }
-
-    async def reset_monthly_credits(self) -> int:
-        """Reset monthly credits for all eligible users"""
-        async with self.pool.acquire() as conn:
-            result = await conn.fetchval("SELECT reset_monthly_credits()")
-            return result
-
+   
     # ============================================================================
     # UTILITY METHODS
     # ============================================================================
@@ -903,34 +866,4 @@ class Database:
             updated_at=row['updated_at']
         )
 
-    # ============================================================================
-    # SIMPLIFIED HELPER METHODS
-    # ============================================================================
     
-    async def ensure_user_exists(self, user_id: str, user_data: dict = None):
-        """Ensure user exists in user_settings table"""
-        async with self.pool.acquire() as conn:
-            # Check if user exists
-            existing_user = await conn.fetchrow(
-                "SELECT user_id FROM user_settings WHERE user_id = $1", 
-                user_id
-            )
-            
-            if not existing_user:
-                # Create new user with defaults
-                await conn.execute("""
-                    INSERT INTO user_settings (
-                        user_id, name, currency, language, timezone
-                    ) VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT (user_id) DO NOTHING
-                """, 
-                user_id, 
-                user_data.get("name", "") if user_data else "",
-                user_data.get("currency", "USD") if user_data else "USD",
-                user_data.get("language", "en") if user_data else "en",
-                user_data.get("timezone", "UTC") if user_data else "UTC"
-                )
-                
-                print(f"✅ Created user settings for user ID: {user_id}")
-            else:
-                print(f"✅ User {user_id} already exists")

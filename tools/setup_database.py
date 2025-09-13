@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Now import with absolute path
-from tools.simple_database import Database
+from tools.database import Database
 
 async def setup_database():
     """Set up the database by creating all tables"""

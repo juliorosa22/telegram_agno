@@ -108,89 +108,38 @@ app.add_middleware(
 )
 
 # API Endpoints
-
 @app.post("/api/v1/start")
-
 async def handle_start(request: StartRequest):
     """Handle /start command with authentication handling"""
     try:
         if not main_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
-
-        # NEW: Handle email-based auth if provided and not authenticated
-        if request.email and not session_manager.is_authenticated(request.user_id):
-            # Attempt auth via email
-            auth_user = await supabase_client.get_user_by_email_auth(request.email)
-            if auth_user:
-                # Link Telegram and create session
-                await supabase_client.link_telegram_to_auth_user(auth_user['user_id'], request.user_id, request.user_data)
-                user_data = {
-                    'user_id': auth_user['user_id'],
-                    'email': request.email,
-                    'first_name': auth_user.get('user_metadata', {}).get('first_name', request.user_data.get('first_name')),
-                    'authenticated': True
-                }
-                session_manager.create_session(request.user_id, user_data)
-                return {
-                    "success": True,
-                    "message": MESSAGES["welcome_authenticated"].format(first_name=user_data.get("first_name", "there"))
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": "❌ Email not found. Please use /register to create an account."
-                }
-
-        # This handle when the user has been redirected from the APP
-        if request.args:
-            try:
-                # Check if user is authenticated for premium linking
-                user_data = await require_authentication(request.user_id)
-                
-                # NEW: Check if already linked to prevent redundant linking
-                supabase_user_id = request.args[0]
-                existing_link = await supabase_client.get_user_by_telegram_id_auth(request.user_id)
-                if existing_link and existing_link.get('user_id') == supabase_user_id:
-                    # Already linked - skip linking and proceed to premium check
-                    pass  # Proceed below
-                else:
-                    # Not linked - perform linking
-                    await supabase_client.link_telegram_user(supabase_user_id, request.user_id)
-                
-                # Check premium status before generating payment link
-                is_premium = await supabase_client.check_premium_status(supabase_user_id)
-                if is_premium:
+        if not session_manager.is_authenticated(request.user_id):
+            # NEW: Use centralized authentication
+            auth_request = AuthCheckRequest(
+                telegram_id=request.user_id,
+                user_name=request.user_data.get("first_name", None),
+                supabase_user_id=request.args[0] if request.args else None
+            )
+            print(f"🔍 Checking auth for /start: {auth_request.user_name}")
+            auth_result = await check_authentication(auth_request)
+            print(f"🔍 Auth result for /start: {auth_result}")
+            if not auth_result.get("authenticated", False):
+                if auth_result.get("must_register", False):
                     return {
                         "success": True,
-                        "message": MESSAGES["welcome_authenticated"].format(first_name=user_data.get("first_name", "there"))
+                        "message": MESSAGES["welcome_unauthenticated"]
                     }
                 else:
-                    # Not premium - get credits and send payment link with credit info
-                    credit_info = await supabase_client.database.get_user_credits(supabase_user_id)
-                    credits_remaining = credit_info.get('credits', 0)
-                    paypal_url = f"https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=YOUR_BUTTON_ID&custom={supabase_user_id}"
-                    
-                    message = MESSAGES["welcome_premium"].format(paypal_url=paypal_url)
-                    message += f"\n\n💳 You have {credits_remaining} credits remaining for freemium features."
-                    
                     return {
-                        "success": True,
-                        "message": message
+                        "success": False,
+                        "message": auth_result.get("message", "Authentication failed")
                     }
-            except HTTPException as e:
-                if e.status_code == 401:
-                    # User not authenticated for premium linking
-                    return {
-                        "success": True,
-                        "message": MESSAGES["need_register_premium"]
-                    }
-                raise e
-        
+            
+        user_data = auth_result["user_data"]
+
         # Handle regular /start command
         try:
-            # Try to get authenticated user data
-            user_data = await require_authentication(request.user_id)
-            
             # User is authenticated - show personalized welcome
             first_name = user_data.get("first_name", request.user_data.get("first_name", "there"))
             return {
@@ -198,14 +147,12 @@ async def handle_start(request: StartRequest):
                 "message": MESSAGES["welcome_authenticated"].format(first_name=first_name)
             }
             
-        except HTTPException as e:
-            if e.status_code == 401:
-                # User not authenticated - show registration prompt
-                return {
-                    "success": True,
-                    "message": MESSAGES["welcome_unauthenticated"]
-                }
-            raise e
+        except Exception as e:
+            print(f"❌ Error in regular start: {e}")
+            return {
+                "success": False,
+                "message": "❌ Welcome! There was an issue connecting to the service."
+            }
         
     except Exception as e:
         print(f"❌ Error in handle_start: {e}")
@@ -220,6 +167,7 @@ async def handle_help():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/api/v1/route-message")
 async def route_message(request: MessageRequest):
     """Route message through main agent - REQUIRES AUTHENTICATION + CREDITS"""
@@ -227,14 +175,18 @@ async def route_message(request: MessageRequest):
         if not main_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # REPLACED: Use the new helper for auth and credits
-        user_data, credit_result = await authenticate_and_check_credits(
-            request.user_id, 'text_message', 1
-        )
+        # Step 1: Get user data using centralized helper
+        user_data = await get_user_data(AuthCheckRequest(telegram_id=request.user_id))
+        supabase_id = user_data.get('user_id', None)
+        telegram_id = request.user_id
+        print("user_data:", user_data)
+        # Step 2: Consume credits (since auth is now verified)
+        credit_result = await check_and_consume_credits(supabase_id, 'text_message', 1, user_data)
         
-        # Process the message
-        result = await main_agent.route_message(request.user_id, request.message, user_data)
+        # Step 3: Process the message
         
+        result = await main_agent.route_message(supabase_id, request.message, user_data)
+
         # Add credit info to response if not premium
         if not credit_result.get('is_premium', False):
             credits_remaining = credit_result.get('credits_remaining', 0)
@@ -252,7 +204,7 @@ async def route_message(request: MessageRequest):
         print(f"❌ Unexpected error in route_message: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# Transactions Endpoints
+####### Transactions Endpoints
 
 @app.post("/api/v1/process-receipt")
 async def process_receipt(user_id: str, file: UploadFile = File(...)):
@@ -261,19 +213,21 @@ async def process_receipt(user_id: str, file: UploadFile = File(...)):
         if not transaction_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # REPLACED: Use the new helper for auth and credits
-        user_data, credit_result = await authenticate_and_check_credits(
-            user_id, 'receipt_processing', 5
-        )
-        
+        # Step 1: Get user data using centralized helper
+        user_data = await get_user_data(AuthCheckRequest(telegram_id=user_id))
+        supabase_id = user_data.get('user_id', None)
+        # Step 2: Consume credits (since auth is now verified)
+        credit_result = await check_and_consume_credits(supabase_id, 'receipt_processing', 5, user_data)
+
+        # Step 3: Process the receipt
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
             content = await file.read()
             temp_file.write(content)
             temp_path = temp_file.name
-        
-        result = await transaction_agent.process_receipt_image(user_id, temp_path)
-        
+
+        result = await transaction_agent.process_receipt_image(supabase_id, temp_path)
+
         # Clean up temp file
         os.unlink(temp_path)
         
@@ -304,21 +258,26 @@ async def process_bank_statement(user_id: str, file: UploadFile = File(...)):
         if not transaction_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # REPLACED: Use the new helper (no credits needed for this endpoint, so pass 0)
-        user_data, _ = await authenticate_and_check_credits(user_id, 'bank_statement', 0)
-        
+        # Step 1: Get user data using centralized helper
+        user_data = await get_user_data(AuthCheckRequest(telegram_id=user_id))
+        supabase_id = user_data.get('user_id', None)
+        # Step 2: Consume credits (since auth is now verified) - Note: 0 credits for bank statement
+        credit_result = await check_and_consume_credits(supabase_id, 'bank_statement', 0, user_data)
+
+        # Step 3: Process the bank statement
         # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             content = await file.read()
             temp_file.write(content)
             temp_path = temp_file.name
-        
-        result = await transaction_agent.process_bank_statement(user_id, temp_path)
-        
+
+        result = await transaction_agent.process_bank_statement(supabase_id, temp_path)
+
         # Clean up temp file
         os.unlink(temp_path)
         
         return TransactionResponse(success=True, message=result)
+        
     except HTTPException:
         # ✅ Re-raise HTTPExceptions (401, 503, etc.)
         raise
@@ -332,6 +291,8 @@ async def process_bank_statement(user_id: str, file: UploadFile = File(...)):
         print(f"❌ Unexpected error in process_bank_statement: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+
+
 @app.post("/api/v1/get-transaction-summary")
 async def get_transaction_summary(request: SummaryRequest):
     """Get transaction summary - REQUIRES AUTHENTICATION"""
@@ -339,10 +300,11 @@ async def get_transaction_summary(request: SummaryRequest):
         if not transaction_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # UPDATED: Use the new helper for auth (no credits needed, so pass 0)
-        user_data, _ = await authenticate_and_check_credits(request.user_id, 'summary', 0)
-        
-        result = await transaction_agent.get_summary(request.user_id, request.days)
+        # Step 1: Get user data using centralized helper
+        user_data = await get_user_data(AuthCheckRequest(telegram_id=request.user_id))
+        supabase_id = user_data.get('user_id', None)
+        # Step 2: Process the summary (no credits needed)
+        result = await transaction_agent.get_summary(supabase_id, request.days)
         return {"success": True, "message": result}
     except HTTPException:
         # ✅ Re-raise HTTPExceptions (401, 503, etc.)
@@ -358,10 +320,11 @@ async def get_reminders(user_id: str, limit: int = 10):
         if not reminder_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
         
-        # UPDATED: Use the new helper for auth (no credits needed, so pass 0)
-        user_data, _ = await authenticate_and_check_credits(user_id, 'reminders', 0)
-        
-        result = await reminder_agent.get_reminders(user_id, limit)
+        # Step 1: Get user data using centralized helper
+        user_data = await get_user_data(AuthCheckRequest(telegram_id=user_id))
+        supabase_id = user_data.get('user_id', None)
+        # Step 2: Process the reminders (no credits needed)
+        result = await reminder_agent.get_reminders(supabase_id, limit)
         return {"success": True, "message": result}
     except HTTPException:
         # ✅ Re-raise HTTPExceptions (401, 503, etc.)
@@ -369,36 +332,6 @@ async def get_reminders(user_id: str, limit: int = 10):
     except Exception as e:
         print(f"❌ Unexpected error in get_reminders: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-
-#Auth endpoints
-async def require_authentication(telegram_id: str) -> Dict[str, Any]:
-    """Check if user is authenticated, return session data or raise exception"""
-    if not session_manager.is_authenticated(telegram_id):
-        # Try to authenticate from database via Supabase Auth
-        user_result = await supabase_client.ensure_user_exists_auth(telegram_id, {})
-        if not user_result.get("success", False) or not user_result.get("authenticated", False):
-            raise HTTPException(status_code=401, detail=MESSAGES["user_not_registered"])
-        # Create session with authenticated user data
-        user_data = user_result["user_data"]
-        session_manager.create_session(telegram_id, user_data)
-        return user_data
-    
-    return session_manager.get_session(telegram_id)
-
-# NEW: Reusable helper for authentication and credit checking
-async def authenticate_and_check_credits(user_id: str, operation_type: str, credits_needed: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Unified function for authentication and credit consumption.
-    Returns (user_data, credit_result).
-    Raises HTTPException on failure.
-    """
-    # Step 1: Authenticate user
-    user_data = await require_authentication(user_id)
-    
-    # Step 2: Check and consume credits
-    credit_result = await check_and_consume_credits(user_id, operation_type, credits_needed)
-    
-    return user_data, credit_result
 
 @app.post("/api/v1/register")
 async def register_user(request: RegisterRequest):
@@ -519,26 +452,35 @@ async def register_user(request: RegisterRequest):
         print(f"❌ Registration error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Update check_authentication endpoint
-@app.post("/api/v1/check-auth")
-async def check_authentication(request: AuthCheckRequest):
-    """Check user authentication status"""
+
+##### Others endpoints
+
+@app.get("/api/v1/profile")
+async def get_profile(user_id: str):
+    """Get user profile - REQUIRES AUTHENTICATION"""
     try:
-        if not session_manager:
-            raise HTTPException(status_code=503, detail="Service not ready")
+        # Step 1: Get user data using centralized helper
+        user_data = await get_user_data(AuthCheckRequest(telegram_id=user_id))
         
-        user_data = await require_authentication(request.telegram_id)
-        return {
-            "success": True,
-            "authenticated": True,
-            "user_data": user_data
-        }
-    except HTTPException as e:
-        return {
-            "success": False,
-            "authenticated": False,
-            "message": e.detail
-        }
+        # Step 2: Format and return profile (no credits needed)
+        profile_message = (
+            f"👤 *Your Profile*\n\n"
+            f"📧 Email: {user_data.get('email', 'Not set')}\n"
+            f"👤 Name: {user_data.get('first_name', 'Unknown')} {user_data.get('last_name', '')}\n"
+            f"🌐 Language: {user_data.get('language', 'en')}\n"
+            f"💰 Currency: {user_data.get('currency', 'USD')}\n"
+            f"⏰ Timezone: {user_data.get('timezone', 'UTC')}\n"
+            f"⭐ Premium: {'Yes' if user_data.get('is_premium') else 'No'}\n"
+        )
+        
+        return {"success": True, "message": profile_message}
+    except HTTPException:
+        # ✅ Re-raise HTTPExceptions (401, 503, etc.)
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected error in get_profile: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @app.get("/api/v1/health")
 async def health_check():
@@ -555,21 +497,162 @@ async def health_check():
         }
     }
 
-# Add this helper function to api.py
 
-async def check_and_consume_credits(user_id: str, operation_type: str, credits_needed: int) -> dict:
-    """Check and consume credits before processing"""
+##### HELPER FUNCTIONS #####
+# Centralized authentication function
+async def check_authentication(request: AuthCheckRequest) -> Dict[str, Any]:
+    """Centralized user authentication flow"""
+    try:
+        # First, check if the telegram_id is linked to a supabase user
+        user_data = await supabase_client.get_user_by_telegram_id_auth(request.telegram_id)
+        #print(f"🔍 Initial user_data in check_authentication: {user_data}")
+        if user_data is None:
+            # No linked telegram user
+            if request.supabase_user_id:
+                # Try to authenticate from database via Supabase Auth
+                # Verify the Supabase ID exists in the auth table and try to link
+                # Here the link still might fail if the supabase_user_id is invalid
+                success = await supabase_client.link_telegram_user(request.supabase_user_id, request.telegram_id, request.user_name)
+                if success:
+                    user_data = await supabase_client.get_user_by_telegram_id_auth(request.telegram_id)
+                    is_authenticated = user_data.get("authenticated", False) if user_data else False
+                    if is_authenticated and user_data:
+                        # Validate and complete user_data if needed
+                        user_data = await _validate_and_complete_user_data(user_data, request.telegram_id)
+                        # Create session
+                        session_manager.create_session(request.telegram_id, user_data)
+                    return {
+                        "success": is_authenticated,
+                        "authenticated": is_authenticated,
+                        "user_data": user_data if is_authenticated else None,
+                        "message": MESSAGES["link_success"].format(first_name=user_data.get("name", "there") if is_authenticated else MESSAGES["failed_retrieve_user_data"])
+                    }
+                else:
+                    # Linking failed
+                    return {
+                        "success": False,
+                        "authenticated": False,
+                        "user_data": None,
+                        "message": MESSAGES["link_failed"]
+                    }
+            else:
+                # No supabase_user_id provided, cannot link
+                # This means the user is not registered
+                return {
+                    "success": False,
+                    "authenticated": False,
+                    "user_data": None,
+                    "must_register": True,
+                    "message": MESSAGES["user_not_registered"]
+                }
+        else:
+            # User is already linked - check if authenticated and data is complete
+            is_authenticated = user_data.get("authenticated", False)
+            if is_authenticated:
+                # Validate and complete user_data
+                user_data = await _validate_and_complete_user_data(user_data, request.telegram_id)
+                return {
+                    "success": True,
+                    "authenticated": True,
+                    "user_data": user_data
+                }
+            else:
+                # User data exists but not authenticated (edge case)
+                return {
+                    "success": False,
+                    "authenticated": False,
+                    "user_data": None,
+                    "message": "User data found but not authenticated"
+                }
+    except Exception as e:
+        print(f"❌ Error in check_authentication: {e}")
+        return {
+            "success": False,
+            "authenticated": False,
+            "user_data": None,
+            "message": "Authentication check failed"
+        }
+
+# Wrap the session manager access in a try-except to avoid crashes and uses the check_authentication function
+async def get_user_data(auth_request: AuthCheckRequest) -> Dict[str, Any]:
+    """Helper to get user data from session or database with fallback to authentication"""
+    try:
+        if session_manager.is_authenticated(auth_request.telegram_id):
+            session = session_manager.get_session(auth_request.telegram_id)
+            if session and _is_user_data_complete(session):
+                print(f"✅ Retrieved complete user data from session for {auth_request.telegram_id}")
+                return session
+            else:
+                # Session authenticated but data missing or incomplete - re-authenticate
+                print(f"⚠️ Session authenticated but data incomplete for {auth_request.telegram_id} - re-authenticating")
+                auth_result = await check_authentication(auth_request)
+                if auth_result.get("authenticated", False):
+                    return auth_result["user_data"]
+                else:
+                    raise HTTPException(status_code=401, detail=auth_result.get("message", "Authentication failed"))
+        else:
+            # Not authenticated - perform authentication
+            print("🔍 No valid session - performing authentication")
+            auth_result = await check_authentication(auth_request)
+            if auth_result.get("authenticated", False):
+                return auth_result["user_data"]
+            else:
+                raise HTTPException(status_code=401, detail=auth_result.get("message", "Authentication failed"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in get_user_data: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# Helper function to validate and complete user data
+async def _validate_and_complete_user_data(user_data: Dict[str, Any], telegram_id: str) -> Dict[str, Any]:
+    """Validate user data completeness and fill in missing fields if possible"""
+    required_fields = ['user_id', 'email', 'first_name', 'authenticated']
+    
+    # Check if all required fields are present and non-empty
+    for field in required_fields:
+        if not user_data.get(field):
+            print(f"⚠️ Missing or empty field '{field}' in user data for {telegram_id} - attempting to complete")
+            # Try to fetch from Supabase Auth if user_id is available
+            if user_data.get('user_id'):
+                try:
+                    auth_user = await supabase_client.supabase.auth.admin.get_user_by_id(user_data['user_id'])
+                    if auth_user.user:
+                        user_data['email'] = auth_user.user.email or user_data.get('email', '')
+                        user_data['first_name'] = auth_user.user.user_metadata.get('first_name', user_data.get('first_name', 'Unknown'))
+                        user_data['last_name'] = auth_user.user.user_metadata.get('last_name', user_data.get('last_name', ''))
+                        user_data['authenticated'] = True
+                        print(f"✅ Completed user data for {telegram_id}")
+                except Exception as e:
+                    print(f"❌ Failed to complete user data for {telegram_id}: {e}")
+            break  # Stop after first missing field to avoid redundant calls
+    
+    return user_data
+
+# Helper function to check if user data is complete
+def _is_user_data_complete(user_data: Dict[str, Any]) -> bool:
+    """Check if user data has all required fields"""
+    required_fields = ['user_id', 'email', 'first_name', 'authenticated']
+    return all(user_data.get(field) for field in required_fields)
+
+
+async def check_and_consume_credits(user_id: str, operation_type: str, credits_needed: int, user_data: Dict[str, Any] = None) -> dict:
+    """Check and consume credits before processing - Assumes auth is already verified"""
     if not supabase_client:
         raise HTTPException(status_code=503, detail="Service not ready")
     
+    # REMOVED: No need to re-check authentication here (it's done upstream)
+    # Use the provided user_data or raise an error if not provided
+    if not user_data:
+        raise HTTPException(status_code=401, detail="User data not provided - authentication required")
+    
     # Try to consume credits
-    result = await supabase_client.database.consume_credits(
+    result = await supabase_client.consume_credits(
         user_id, operation_type, credits_needed
     )
     
     if not result['success']:
         if result.get('error') == 'insufficient_credits':
-            # Format friendly error message
             credits_available = result.get('credits_available', 0)
             credits_needed = result.get('credits_needed', 0)
             
@@ -578,37 +661,12 @@ async def check_and_consume_credits(user_id: str, operation_type: str, credits_n
                 credits_needed=credits_needed
             )
             
-            raise HTTPException(status_code=402, detail=error_msg)  # 402 Payment Required
+            raise HTTPException(status_code=402, detail=error_msg)
         else:
             raise HTTPException(status_code=400, detail=result.get('message', 'Credit operation failed'))
     
     return result
 
-@app.get("/api/v1/credits/{user_id}")
-async def get_credit_status(user_id: str):
-    """Get user's credit status"""
-    try:
-        # Require authentication
-        await require_authentication(user_id)
-        
-        credit_info = await supabase_client.database.get_user_credits(user_id)
-        
-        if credit_info.get('error'):
-            raise HTTPException(status_code=404, detail=credit_info['error'])
-        
-        return {
-            "success": True,
-            "credits": credit_info['credits'],
-            "is_premium": credit_info['is_premium'],
-            "credits_reset_date": credit_info['credits_reset_date'],
-            "premium_until": credit_info['premium_until']
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"❌ Error getting credit status: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
 
 def run_api():
     """Run the API server"""

@@ -3,7 +3,8 @@ import re
 import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
-
+import asyncio  # <-- 1. IMPORT ASYNCIO
+from agno.models.groq import Groq
 # Fix: Use package imports from __init__.py
 from tools import Transaction, TransactionType
 
@@ -24,7 +25,7 @@ class TransactionAgent:
         # Initialize Groq agent for text processing (cost-effective)
         self.text_agent = Agent(
             name="TextTransactionProcessor",
-            model="groq/llama-3.1-70b",  # Ultra-fast, very low cost for text
+            model=Groq(id="llama-3.3-70b-versatile", temperature=0.2),  # Ultra-fast, very low cost for text
             instructions=f"""
             You are a financial transaction processor specialized in extracting transaction data from text messages.
             
@@ -51,7 +52,7 @@ class TransactionAgent:
         # Initialize Gemini agent for vision processing (receipt/image analysis)
         self.vision_agent = Agent(
             name="VisionTransactionProcessor",
-            model="gemini-1.5-flash",  # Cost-effective with vision capabilities
+            model="gemini-1.5-flash", #TODO adjust properly # Cost-effective with vision capabilities
             instructions=f"""
             You are a receipt and document processor that extracts financial data from images and PDFs.
             
@@ -62,7 +63,7 @@ class TransactionAgent:
             - Total amount (the final amount paid)
             - Merchant/store name
             - Date of transaction
-            - Category (choose from expense categories above)
+            - Category (choose from: {self.expense_categories})
             - Any notable items
             
             For bank statements, extract:
@@ -81,31 +82,47 @@ class TransactionAgent:
         try:
             # Use Groq for fast, cheap text processing
             extraction_prompt = f"""
-            Extract transaction details from this message: "{message}"
-            
-            EXPENSE categories: {self.expense_categories}
-            INCOME categories: {self.income_categories}
-            
-            Return ONLY a JSON object with:
-            - amount: number (positive value)
-            - description: string (clean description)
-            - transaction_type: "expense" or "income"
-            - category: string (MUST be from the lists above)
-            - merchant: string or null
-            - confidence: number (0.0 to 1.0)
-            
-            Rules:
-            - Category MUST be exactly one from the appropriate list
-            - If expense, choose from: {self.expense_categories}
-            - If income, choose from: {self.income_categories}
-            - If unsure, use "Shopping" for expenses or "Other Income" for income
-            
-            If no transaction is found, return {{"transaction_found": false}}
-            
-            JSON only, no explanation:
+You are a precise financial data extractor. Your task is to analyze the user's message and extract transaction details into a strict JSON format.
+
+**Step-by-Step Thought Process:**
+1.  **Identify Intent:** First, determine if the message describes an **expense** (money going out) or an **income** (money coming in).
+    *   **Expense Keywords:** Look for words like 'spent', 'paid', 'bought', 'cost', 'charged', 'bill'. If no keywords are present, most transactions are expenses by default (e.g., "uber ride $25").
+    *   **Income Keywords:** Look for words like 'earned', 'received', 'got paid', 'salary', 'bonus', 'refund', 'deposit','freelance'.
+2.  **Select Category List:** Based on the intent, select the appropriate category list.
+    *   **Expense Categories:** {self.expense_categories}
+    *   **Income Categories:** {self.income_categories}
+3.  **Extract Data:** Pull all required fields and strictly adhere to the output format.
+
+**User Message:** "{message}"
+
+**Rules & Output Format:**
+- Return ONLY a valid JSON object. No explanations or surrounding text.
+- The `transaction_type` MUST be either "expense" or "income".
+- The `category` MUST be one of the exact strings from the chosen list.
+- If you are unsure of the category, use "Shopping" for expenses or "Other Income" for income.
+- If no clear transaction is found, return `{{"transaction_found": false}}`.
+
+**Examples:**
+- User: "just paid 20 bucks for my spotify sub" -> {{"amount": 20.00, "description": "Spotify subscription", "transaction_type": "expense", "category": "Entertainment", "merchant": "Spotify", "confidence": 0.95}}
+- User: "got a $50 refund from amazon" -> {{"amount": 50.00, "description": "Refund from Amazon", "transaction_type": "income", "category": "Refund", "merchant": "Amazon", "confidence": 0.9}}
+- User: "salary deposit $3000" -> {{"amount": 3000.00, "description": "Salary deposit", "transaction_type": "income", "category": "Salary", "merchant": null, "confidence": 1.0}}
+
+**JSON Output:**
+```json
+{{
+  "amount": <number>,
+  "description": "<string>",
+  "transaction_type": "<'expense' or 'income'>",
+  "category": "<string from lists>",
+  "merchant": "<string or null>",
+  "confidence": <number from 0.0 to 1.0>,
+  "transaction_found": true
+}}
             """
             
-            response = await self.text_agent.run(extraction_prompt)
+            # --- 2. APPLY THE FIX HERE ---
+            response_obj = await asyncio.to_thread(self.text_agent.run, extraction_prompt)
+            response = str(response_obj)
             
             # Enhanced JSON parsing for Groq responses
             try:
@@ -127,7 +144,7 @@ class TransactionAgent:
             # Validate and fix category
             validated_category = self._validate_category(data["category"], data["transaction_type"])
             data["category"] = validated_category
-            
+            print("Extracted data:", data)
             # Create and save transaction
             transaction = Transaction(
                 user_id=user_id,

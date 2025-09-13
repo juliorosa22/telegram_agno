@@ -1,7 +1,8 @@
 from agno.agent import Agent
 import re
 from typing import Dict, Any
-
+import asyncio  # <-- 1. IMPORT ASYNCIO
+from agno.models.groq import Groq
 # Fix: Use package imports
 from tools import Transaction, Reminder  # Import from package __init__.py
 
@@ -14,7 +15,7 @@ class MainAgent:
         # Initialize Agno agent for intent classification
         self.agent = Agent(
             name="MainAssistant",
-            model="groq/llama-3.1-70b",
+            model=Groq(id="llama-3.3-70b-versatile", temperature=0.2),
             instructions="""
             You are the main coordinator for a personal tracking assistant.
 
@@ -38,12 +39,16 @@ class MainAgent:
         """Route user message to appropriate agent based on intent - NO AUTH CHECK"""
         try:
             # User is already authenticated at this point (checked in API layer)
-            
-            # Classify message intent using Agno
-            intent_response = await self.agent.run(
+            print("before passing to groq")
+
+            # --- 2. RUN THE BLOCKING CALL IN A SEPARATE THREAD ---
+            intent_response_obj = await asyncio.to_thread(
+                self.agent.run,
                 f"Classify this user message and explain briefly: '{message}'"
             )
-            
+            intent_response = str(intent_response_obj)
+
+            #print("Intent response:", intent_response)
             # Route based on intent classification
             if self._contains_intent(intent_response, "TRANSACTION"):
                 from .transaction_agent import TransactionAgent
@@ -66,12 +71,16 @@ class MainAgent:
                 
             else:
                 # General conversation
-                return await self.agent.run(
+                # --- 3. APPLY THE FIX HERE AS WELL ---
+                general_response_obj = await asyncio.to_thread(
+                    self.agent.run,
                     f"Respond helpfully to this message about financial tracking: '{message}'. "
                     "Suggest how they can use the assistant for their financial needs."
                 )
+                return str(general_response_obj)
                 
         except Exception as e:
+            #print("failed to route message")
             print(f"❌ Error routing message: {e}")
             return "❌ Sorry, I encountered an error. Please try rephrasing your request."
     

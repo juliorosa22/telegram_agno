@@ -1,0 +1,77 @@
+# NEW: Handle email-based auth if provided and not authenticated
+        if request.email and not session_manager.is_authenticated(request.user_id):
+            # Attempt auth via email
+            auth_user = await supabase_client.get_user_by_email_auth(request.email)
+            if auth_user:
+                # Link Telegram and create session
+                await supabase_client.link_telegram_to_auth_user(auth_user['user_id'], request.user_id, request.user_data)
+                user_data = {
+                    'user_id': auth_user['user_id'],
+                    'email': request.email,
+                    'first_name': auth_user.get('user_metadata', {}).get('first_name', request.user_data.get('first_name')),
+                    'authenticated': True
+                }
+                session_manager.create_session(request.user_id, user_data)
+                return {
+                    "success": True,
+                    "message": MESSAGES["welcome_authenticated"].format(first_name=user_data.get("first_name", "there"))
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "❌ Email not found. Please use /register to create an account."
+                }
+
+        # Handle when the user has been redirected from the APP
+        if request.args:
+            try:
+                # Check if user is authenticated for premium linking (already done above)
+                
+                # NEW: Check if already linked to prevent redundant linking
+                supabase_user_id = request.args[0]
+                
+                # UPDATED: First, verify the Supabase ID exists in the auth table
+                user_exists = await supabase_client.check_user_by_baseid(supabase_user_id)
+                if not user_exists:
+                    return {
+                        "success": False,
+                        "message": "❌ Invalid Supabase ID provided from the app redirect. Please ensure you are logged in to the app and try again."
+                    }
+                
+                existing_link = await supabase_client.get_user_by_telegram_id_auth(request.user_id)
+                if existing_link and existing_link.get('user_id') == supabase_user_id:
+                    # Already linked - skip linking and proceed to premium check
+                    pass  # Proceed below
+                else:
+                    # Not linked - perform linking
+                    await supabase_client.link_telegram_user(supabase_user_id, request.user_id)
+                
+                # Check premium status before generating payment link
+                is_premium = await supabase_client.check_premium_status(supabase_user_id)
+                if is_premium:
+                    return {
+                        "success": True,
+                        "message": MESSAGES["welcome_authenticated"].format(first_name=user_data.get("first_name", "there"))
+                    }
+                else:
+                    # Not premium - get credits and send payment link with credit info
+                    credit_info = await supabase_client.database.get_user_credits(supabase_user_id)
+                    credits_remaining = credit_info.get('credits', 0)
+                    paypal_url = f"https://www.paypal.com/cgi-bin/webscr?cmd=_s-xclick&hosted_button_id=YOUR_BUTTON_ID&custom={supabase_user_id}"
+                    
+                    message = MESSAGES["welcome_premium"].format(paypal_url=paypal_url)
+                    message += f"\n\n💳 You have {credits_remaining} credits remaining for freemium features."
+                    
+                    return {
+                        "success": True,
+                        "message": message
+                    }
+            except HTTPException as e:
+                if e.status_code == 401:
+                    # User not authenticated for premium linking
+                    return {
+                        "success": True,
+                        "message": MESSAGES["need_register_premium"]
+                    }
+                raise e
+        
