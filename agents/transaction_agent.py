@@ -6,12 +6,13 @@ from typing import Dict, Any, Optional
 import asyncio  # <-- 1. IMPORT ASYNCIO
 from agno.models.groq import Groq
 # Fix: Use package imports from __init__.py
-from tools import Transaction, TransactionType
+from tools import Transaction, TransactionType, SupabaseClient
+
 
 class TransactionAgent:
     """Specialized agent for handling financial transactions"""
-    
-    def __init__(self, supabase_client):
+
+    def __init__(self, supabase_client: SupabaseClient):
         self.supabase_client = supabase_client
         
         # Define simplified categories
@@ -25,27 +26,30 @@ class TransactionAgent:
         # Initialize Groq agent for text processing (cost-effective)
         self.text_agent = Agent(
             name="TextTransactionProcessor",
-            model=Groq(id="llama-3.3-70b-versatile", temperature=0.2),  # Ultra-fast, very low cost for text
+            model=Groq(id="llama-3.3-70b-versatile", temperature=0.1),  # Lower temp for stricter JSON
             instructions=f"""
-            You are a financial transaction processor specialized in extracting transaction data from text messages.
-            
-            EXPENSE CATEGORIES (use exactly one of these):
-            {expense_cats}
-            
-            INCOME CATEGORIES (use exactly one of these):
-            {income_cats}
-            
-            Extract from text messages:
-            - Amount (convert to positive number)
-            - Description (clean, concise)
-            - Transaction type (expense or income)
-            - Category (choose from the appropriate list above)
-            - Merchant (if mentioned)
-            
-            IMPORTANT: Category MUST be exactly one from the predefined lists.
-            If unsure, use "Shopping" for expenses or "Other Income" for income.
-            
-            Always return valid JSON format only, no explanations.
+                You are a precise financial data extractor. Your task is to analyze a user's message and extract transaction details into a strict JSON format.
+
+                **Step-by-Step Thought Process:**
+                1.  **Identify Intent:** First, determine if the message describes an **expense** (money going out) or an **income** (money coming in).
+                    *   **Expense Keywords:** Look for words like 'spent', 'paid', 'bought', 'cost', 'charged', 'bill'. If no keywords are present, most transactions are expenses by default (e.g., "uber ride $25").
+                    *   **Income Keywords:** Look for words like 'earned', 'received', 'got paid', 'salary', 'bonus', 'refund', 'deposit'.
+                2.  **Select Category List:** Based on the intent, select the appropriate category list.
+                    *   **Expense Categories:** {expense_cats}
+                    *   **Income Categories:** {income_cats}
+                3.  **Extract Data:** Pull all required fields and strictly adhere to the output format.
+
+                **Rules & Output Format:**
+                - Return ONLY a valid JSON object. No explanations or surrounding text.
+                - The `transaction_type` MUST be either "expense" or "income".
+                - The `category` MUST be one of the exact strings from the chosen list.
+                - If you are unsure of the category, use "Shopping" for expenses or "Other Income" for income.
+                - If no clear transaction is found, return `{{"transaction_found": false}}`.
+
+                **Examples:**
+                - User: "just paid 20 bucks for my spotify sub" -> {{"amount": 20.00, "description": "Spotify subscription", "transaction_type": "expense", "category": "Entertainment", "merchant": "Spotify", "confidence": 0.95, "transaction_found": true}}
+                - User: "got a $50 refund from amazon" -> {{"amount": 50.00, "description": "Refund from Amazon", "transaction_type": "income", "category": "Refund", "merchant": "Amazon", "confidence": 0.9, "transaction_found": true}}
+                - User: "salary deposit $3000" -> {{"amount": 3000.00, "description": "Salary deposit", "transaction_type": "income", "category": "Salary", "merchant": null, "confidence": 1.0, "transaction_found": true}}
             """
         )
         
@@ -76,54 +80,26 @@ class TransactionAgent:
             Always return valid JSON format only, no explanations.
             """
         )
-    
-    async def process_message(self, user_id: str, message: str) -> str:
+    #TODO adapt to respond in user's language
+    async def process_message(self, user_id: str, message: str, lang: str) -> str:
         """Process a text message for transaction data using Groq"""
+        
+        lang_map = {'es': 'Spanish', 'pt': 'Portuguese', 'en': 'English'}
+        lang_name = lang_map.get(lang.split('-')[0], 'English')
         try:
-            # Use Groq for fast, cheap text processing
+            # The agent now has all instructions. Just pass the user's message.
             extraction_prompt = f"""
-You are a precise financial data extractor. Your task is to analyze the user's message and extract transaction details into a strict JSON format.
+             The user is speaking {lang_name}. Analyze the following user message and return the JSON output.
+            Respond in {lang_name} for the confirmation message.
 
-**Step-by-Step Thought Process:**
-1.  **Identify Intent:** First, determine if the message describes an **expense** (money going out) or an **income** (money coming in).
-    *   **Expense Keywords:** Look for words like 'spent', 'paid', 'bought', 'cost', 'charged', 'bill'. If no keywords are present, most transactions are expenses by default (e.g., "uber ride $25").
-    *   **Income Keywords:** Look for words like 'earned', 'received', 'got paid', 'salary', 'bonus', 'refund', 'deposit','freelance'.
-2.  **Select Category List:** Based on the intent, select the appropriate category list.
-    *   **Expense Categories:** {self.expense_categories}
-    *   **Income Categories:** {self.income_categories}
-3.  **Extract Data:** Pull all required fields and strictly adhere to the output format.
+            **User Message:** "{message}"
 
-**User Message:** "{message}"
-
-**Rules & Output Format:**
-- Return ONLY a valid JSON object. No explanations or surrounding text.
-- The `transaction_type` MUST be either "expense" or "income".
-- The `category` MUST be one of the exact strings from the chosen list.
-- If you are unsure of the category, use "Shopping" for expenses or "Other Income" for income.
-- If no clear transaction is found, return `{{"transaction_found": false}}`.
-
-**Examples:**
-- User: "just paid 20 bucks for my spotify sub" -> {{"amount": 20.00, "description": "Spotify subscription", "transaction_type": "expense", "category": "Entertainment", "merchant": "Spotify", "confidence": 0.95}}
-- User: "got a $50 refund from amazon" -> {{"amount": 50.00, "description": "Refund from Amazon", "transaction_type": "income", "category": "Refund", "merchant": "Amazon", "confidence": 0.9}}
-- User: "salary deposit $3000" -> {{"amount": 3000.00, "description": "Salary deposit", "transaction_type": "income", "category": "Salary", "merchant": null, "confidence": 1.0}}
-
-**JSON Output:**
-```json
-{{
-  "amount": <number>,
-  "description": "<string>",
-  "transaction_type": "<'expense' or 'income'>",
-  "category": "<string from lists>",
-  "merchant": "<string or null>",
-  "confidence": <number from 0.0 to 1.0>,
-  "transaction_found": true
-}}
+            **JSON Output:**
             """
             
-            # --- 2. APPLY THE FIX HERE ---
             response_obj = await asyncio.to_thread(self.text_agent.run, extraction_prompt)
-            response = str(response_obj)
-            
+            response = response_obj.content # <-- FIX: Access the .content attribute
+            print("Raw response from Groq:", response)
             # Enhanced JSON parsing for Groq responses
             try:
                 # Clean response to extract JSON
@@ -164,20 +140,21 @@ You are a precise financial data extractor. Your task is to analyze the user's m
             
             # Generate response
             emoji = "💸" if data["transaction_type"] == "expense" else "💰"
+            #TODO adapt to respond in user's language
             return (
                 f"{emoji} *Transaction recorded!*\n\n"
                 f"📝 *Description:* {data['description']}\n"
                 f"💵 *Amount:* ${data['amount']:.2f}\n"
                 f"📂 *Category:* {data['category']}\n"
                 f"📊 *Type:* {data['transaction_type'].title()}\n"
-                f"🚀 *Processed by:* Groq Llama 3.1 70B"
+                #f"🚀 *Processed by:* Groq Llama 3.1 70B"
             )
             
         except Exception as e:
-            print(f"❌ Error processing transaction message: {e}")
+            print(f"❌ Transaction Agent: Error processing transaction message: {e}")
             return "❌ Sorry, I couldn't process that transaction. Please try again with a clearer format."
-    
-    async def process_receipt_image(self, user_id: str, image_path: str) -> str:
+
+    async def process_receipt_image(self, user_id: str, image_path: str, lang: str = 'en') -> str:
         """Process receipt image using Gemini vision capabilities"""
         try:
             # Use Gemini vision to extract receipt data
@@ -200,10 +177,12 @@ You are a precise financial data extractor. Your task is to analyze the user's m
             Return ONLY a JSON object with the extracted data, no explanation:
             """
             
-            response = await self.vision_agent.run(
+            response_obj = await asyncio.to_thread(
+                self.vision_agent.run,
                 extraction_prompt,
                 images=[image_path]
             )
+            response = response_obj.content # <-- FIX: Access the .content attribute
             
             # Parse the response
             try:
@@ -251,10 +230,10 @@ You are a precise financial data extractor. Your task is to analyze the user's m
             )
             
         except Exception as e:
-            print(f"❌ Error processing receipt image: {e}")
+            print(f"❌ Transaction (Receipt): Error processing receipt image: {e}")
             return "❌ Sorry, I couldn't process that receipt image. Please try again or enter the transaction manually."
-    
-    async def process_bank_statement(self, user_id: str, pdf_path: str) -> str:
+
+    async def process_bank_statement(self, user_id: str, pdf_path: str, lang: str = 'en') -> str:
         """Process bank statement PDF using Gemini"""
         try:
             # Use Gemini to extract multiple transactions from PDF
@@ -278,10 +257,12 @@ You are a precise financial data extractor. Your task is to analyze the user's m
             Return ONLY a JSON array of transactions, no explanation:
             """
             
-            response = await self.vision_agent.run(
+            response_obj = await asyncio.to_thread(
+                self.vision_agent.run,
                 extraction_prompt,
                 files=[pdf_path]
             )
+            response = response_obj.content # <-- FIX: Access the .content attribute
             
             # Parse transactions
             try:
@@ -337,14 +318,15 @@ You are a precise financial data extractor. Your task is to analyze the user's m
                 f"✅ *{saved_count} transactions imported*\n"
                 f"📊 *Ready for analysis*\n\n"
                 f"Use /balance to see your updated summary!\n"
-                f"🔍 *Processed by:* Gemini 1.5 Flash"
+               # f"🔍 *Processed by:* Gemini 1.5 Flash"
             )
             
         except Exception as e:
-            print(f"❌ Error processing bank statement: {e}")
+            print(f"❌ Transaction (Bank Statement): Error processing bank statement: {e}")
             return "❌ Sorry, I couldn't process that bank statement. Please ensure it's a valid PDF with transaction data."
     
-    async def get_summary(self, user_id: str, days: int = 30) -> str:
+    #TODO adapt to respond in user's language
+    async def get_summary(self, user_id: str, days: int = 30, lang: str = 'en') -> str:
         """Generate financial summary using Groq for insights"""
         try:
             # Get summary data from database
@@ -364,7 +346,8 @@ You are a precise financial data extractor. Your task is to analyze the user's m
             Keep it concise and encouraging.
             """
             
-            insights = await self.text_agent.run(insights_prompt)
+            insights_obj = await asyncio.to_thread(self.text_agent.run, insights_prompt)
+            insights = insights_obj.content # <-- FIX: Access the .content attribute
             
             # Calculate net flow
             net_flow = summary.total_income - summary.total_expenses
@@ -384,7 +367,7 @@ You are a precise financial data extractor. Your task is to analyze the user's m
             for cat in summary.expense_categories[:3]:
                 message += f"• {cat['category']}: ${cat['total']:,.2f}\n"
             
-            message += f"\n*AI Insights:*\n{insights}\n\n🚀 *Analysis by:* Groq Llama 3.1 70B"
+            #message += f"\n*AI Insights:*\n{insights}\n\n🚀 *Analysis by:* Groq Llama 3.1 70B"
             
             return message
             

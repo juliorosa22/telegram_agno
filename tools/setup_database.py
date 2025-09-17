@@ -118,16 +118,10 @@ async def reset_database():
             await conn.execute("DROP POLICY IF EXISTS \"Users can update own reminders\" ON reminders;")
             await conn.execute("DROP POLICY IF EXISTS \"Users can delete own reminders\" ON reminders;")
             
-            await conn.execute("DROP POLICY IF EXISTS \"Users can view own activity\" ON user_activity;")
-            await conn.execute("DROP POLICY IF EXISTS \"Users can insert own activity\" ON user_activity;")
-            
             await conn.execute("DROP POLICY IF EXISTS \"Users can view own settings\" ON user_settings;")
             await conn.execute("DROP POLICY IF EXISTS \"Users can insert own settings\" ON user_settings;")
             await conn.execute("DROP POLICY IF EXISTS \"Users can update own settings\" ON user_settings;")
             await conn.execute("DROP POLICY IF EXISTS \"Users can delete own settings\" ON user_settings;")
-            
-            await conn.execute("DROP POLICY IF EXISTS \"Users can view own credit usage\" ON credit_usage;")
-            await conn.execute("DROP POLICY IF EXISTS \"Users can insert own credit usage\" ON credit_usage;")
             
             await conn.execute("DROP POLICY IF EXISTS \"Users can view own payments\" ON payments;")
             await conn.execute("DROP POLICY IF EXISTS \"Users can insert own payments\" ON payments;")
@@ -141,10 +135,8 @@ async def reset_database():
             await conn.execute("DROP TRIGGER IF EXISTS payment_success_trigger ON payments;")
             
             # Drop all tables
-            await conn.execute("DROP TABLE IF EXISTS user_activity CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS transactions CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS reminders CASCADE;")
-            await conn.execute("DROP TABLE IF EXISTS credit_usage CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS payments CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS user_settings CASCADE;")
             

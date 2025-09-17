@@ -1,0 +1,20 @@
+Step-by-Step Deployment Plan
+Containerize Your Application: Create a Dockerfile for your project. This file tells Google Cloud how to build a container image of your application, including installing dependencies from requirements.txt.
+
+Push the Container to Artifact Registry: Build your container image and push it to Google's private container registry.
+
+Deploy to Cloud Run:
+
+Create a new Cloud Run service and select the container image you just pushed.
+Crucially, for Ingress (networking), select "Allow internal traffic and traffic from Cloud Load Balancing." This prevents the public from accessing your service directly over unencrypted HTTP.
+Configure all your environment variables (SUPABASE_URL, STRIPE_API_KEY, etc.) in the Cloud Run settings.
+Set up the External HTTPS Load Balancer:
+
+Go to the Load Balancing section in the Google Cloud Console.
+Create a new "External HTTPS Load Balancer."
+Frontend Configuration: This is the public-facing part. You'll create a forwarding rule, reserve a static IP address, and create a Google-managed SSL certificate for your domain (e.g., api.yourdomain.com). Google handles the creation and renewal of this certificate for free.
+Backend Configuration: For the backend, you will select "Cloud Run" and point it to the service you created in the previous step.
+Update Your DNS: Point your domain's A record (e.g., api.yourdomain.com) to the static IP address you reserved for the load balancer.
+
+Update Stripe Webhook URL: In your Stripe Dashboard, update the webhook endpoint to your new, live, HTTPS URL: https://api.yourdomain.com/api/v1/webhooks/stripe.
+

@@ -1,4 +1,7 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, BackgroundTasks
+from fastapi import FastAPI, HTTPException, File, UploadFile, BackgroundTasks, Request
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles # <-- 1. Import StaticFiles
+from fastapi.templating import Jinja2Templates # <-- 2. Import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Tuple
@@ -10,7 +13,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # Import standardized messages
-from messages import MESSAGES
+from messages import MESSAGES, get_message
 
 # Import models
 from models import (
@@ -21,7 +24,8 @@ from models import (
     StartRequest,
     UserCheckRequest,
     RegisterRequest,
-    AuthCheckRequest
+    AuthCheckRequest,
+    UpgradeRequest
 )
 
 # Load environment
@@ -90,13 +94,18 @@ async def lifespan(app: FastAPI):
         
         print("🛑 API services stopped")
 
-# Create FastAPI app with lifespan
+# Create FastAPI app
 app = FastAPI(
     title="OkanFit Assist AI API",
     description="Financial AI processing service",
     version="1.0.0",
-    lifespan=lifespan  # Use the lifespan context manager
+    lifespan=lifespan
 )
+
+# --- 3. Mount the static directory and configure templates ---
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
 
 # Add CORS
 app.add_middleware(
@@ -107,13 +116,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- 4. Create the root endpoint to serve the website ---
+@app.get("/", response_class=HTMLResponse)
+async def read_root(request: Request):
+    """Serves the main landing page."""
+    return templates.TemplateResponse("index.html", {"request": request})
+
+# You can add placeholder pages for privacy and terms to satisfy Stripe
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy(request: Request):
+    return "<h1>Privacy Policy</h1><p>Details coming soon.</p>"
+
+@app.get("/terms", response_class=HTMLResponse)
+async def terms_of_service(request: Request):
+    return "<h1>Terms of Service</h1><p>Details coming soon.</p>"
+
+
 # API Endpoints
+@app.get("/api/v1/auth/confirm", response_class=HTMLResponse)
+async def handle_email_confirmation():
+    """
+    Serves a simple HTML page for when a user successfully confirms their email.
+    This URL should be set as the confirmation redirect in Supabase Auth settings.
+    """
+    # Use the URL from the new static files mount
+    logo_url = "/static/images/okan_assist_upscale.png" 
+    download_url = os.getenv("APP_DOWNLOAD_URL", "https://play.google.com/store/apps/details?id=com.okanassist")
+
+    html_content = MESSAGES["registration_html_success"].format(
+        logo_url=logo_url,
+        download_url=download_url
+    )
+    return HTMLResponse(content=html_content)
+
+
 @app.post("/api/v1/start")
 async def handle_start(request: StartRequest):
     """Handle /start command with authentication handling"""
+    lang = request.language_code
     try:
         if not main_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
+        user_data = None
         if not session_manager.is_authenticated(request.user_id):
             # NEW: Use centralized authentication
             auth_request = AuthCheckRequest(
@@ -128,15 +172,16 @@ async def handle_start(request: StartRequest):
                 if auth_result.get("must_register", False):
                     return {
                         "success": True,
-                        "message": MESSAGES["welcome_unauthenticated"]
+                        "message": get_message("welcome_unauthenticated", lang)
                     }
                 else:
                     return {
                         "success": False,
                         "message": auth_result.get("message", "Authentication failed")
                     }
-            
-        user_data = auth_result["user_data"]
+        
+
+        user_data = session_manager.get_session(request.user_id)
 
         # Handle regular /start command
         try:
@@ -144,7 +189,7 @@ async def handle_start(request: StartRequest):
             first_name = user_data.get("first_name", request.user_data.get("first_name", "there"))
             return {
                 "success": True,
-                "message": MESSAGES["welcome_authenticated"].format(first_name=first_name)
+                "message": get_message("welcome_authenticated", lang, first_name=first_name)
             }
             
         except Exception as e:
@@ -159,18 +204,88 @@ async def handle_start(request: StartRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/help")
-async def handle_help():
+async def handle_help(language_code: Optional[str] = 'en'):
     """Handle /help command - No authentication required"""
     try:
         # Help is available to everyone, no authentication needed
-        return {"success": True, "message": MESSAGES["help_message"]}
+        return {"success": True, "message": get_message("help_message", language_code)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/upgrade")
+async def handle_upgrade(request: UpgradeRequest):
+    """Handles the premium upgrade request and generates a payment link."""
+    try:
+        # 1. Authenticate the user and get their data
+        auth_request = AuthCheckRequest(telegram_id=request.user_id)
+        user_data = await get_user_data(auth_request)
+
+        # 2. Check if the user is already premium
+        if user_data.get("is_premium"):
+            return {
+                "success": False,
+                "message": "✅ You are already a Premium user! You have unlimited access to all features."
+            }
+
+        # 3. Generate the payment link
+        payment_details = await supabase_client.create_upgrade_link(user_data)
+
+        if not payment_details.get("success"):
+            raise HTTPException(status_code=500, detail="Could not generate payment link.")
+
+        # 4. Format the response message for the user
+        message = MESSAGES["upgrade_to_premium"].format(
+            first_name=user_data.get("first_name", "there"),
+            stripe_url=payment_details["stripe_url"] # <-- 1. Use stripe_url
+        )
+        
+        return {"success": True, "message": message}
+
+    except HTTPException as e:
+        if e.status_code == 401:
+            # User is not registered, re-raise the exception for the bot handler
+            raise
+        # For other HTTP exceptions, return a structured error
+        return {"success": False, "message": e.detail}
+    except Exception as e:
+        print(f"❌ Error in handle_upgrade: {e}")
+        raise HTTPException(status_code=500, detail="An internal error occurred while processing your upgrade request.")
+
+
+
+@app.post("/api/v1/webhooks/stripe")
+async def handle_stripe_webhook(request: Request):
+    """Handles incoming webhooks from Stripe to confirm payments."""
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    payload = await request.body()
+    sig_header = request.headers.get('stripe-signature')
+
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing Stripe-Signature header")
+
+    try:
+        # Pass the raw payload and signature header to the handler
+        success = await supabase_client.handle_stripe_webhook(payload, sig_header)
+        
+        if success:
+            # Acknowledged and processed successfully
+            return JSONResponse(content={"status": "success"}, status_code=200)
+        else:
+            # Acknowledged but failed to process
+            return JSONResponse(content={"status": "failed"}, status_code=400)
+
+    except Exception as e:
+        print(f"❌ Error processing Stripe webhook: {e}")
+        # Return an error to Stripe so it knows the webhook failed
+        return JSONResponse(content={"status": "error"}, status_code=500)
 
 
 @app.post("/api/v1/route-message")
 async def route_message(request: MessageRequest):
     """Route message through main agent - REQUIRES AUTHENTICATION + CREDITS"""
+    lang = request.language_code
     try:
         if not main_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
@@ -182,19 +297,22 @@ async def route_message(request: MessageRequest):
         print("user_data:", user_data)
         # Step 2: Consume credits (since auth is now verified)
         credit_result = await check_and_consume_credits(supabase_id, 'text_message', 1, user_data)
-        
+        print("credit_result:", credit_result)
+        user_data.setdefault('language', lang)  # Ensure language is set in user_data
         # Step 3: Process the message
-        
-        result = await main_agent.route_message(supabase_id, request.message, user_data)
+        if credit_result["success"]:
+            result = await main_agent.route_message(supabase_id, request.message, user_data)
+            # Add credit info to response if not premium
+            if not credit_result.get('is_premium', False):
+                credits_remaining = credit_result.get('credits_remaining', 0)
+                result += get_message("credit_warning", lang, credits_remaining=credits_remaining)
+                if credits_remaining <= 1:
+                    result += get_message("credit_low", lang)
 
-        # Add credit info to response if not premium
-        if not credit_result.get('is_premium', False):
-            credits_remaining = credit_result.get('credits_remaining', 0)
-            result += MESSAGES["credit_warning"].format(credits_remaining=credits_remaining)
-            if credits_remaining <= 1:
-                result += MESSAGES["credit_low"]
-        
-        return {"success": True, "message": result}
+            return {"success": True, "message": result}
+        else:
+           
+            return {"success": False, "message": credit_result.get("message")}
         
     except HTTPException:
         # ✅ Re-raise HTTPExceptions (401, 402, 503, etc.) without modification
@@ -352,14 +470,10 @@ async def register_user(request: RegisterRequest):
         existing_auth_user = await supabase_client.get_user_by_email_auth(request.email)
         if existing_auth_user:
             # Email exists, try to link it to this Telegram account
-            success = await supabase_client.link_telegram_to_auth_user(
+            success = await supabase_client.link_telegram_user( 
                 existing_auth_user['user_id'],
                 request.telegram_id,
-                {
-                    'first_name': request.first_name,
-                    'last_name': request.last_name,
-                    'language_code': request.language_code
-                }
+                f"{request.first_name} {request.last_name}",
             )
             
             if success:
@@ -410,17 +524,15 @@ async def register_user(request: RegisterRequest):
             }
         
         # Link Telegram ID to the new auth user
-        success = await supabase_client.link_telegram_to_auth_user(
+        success = await supabase_client.link_telegram_user(
             auth_result['user_id'],
             request.telegram_id,
-            {
-                'first_name': request.first_name,
-                'last_name': request.last_name,
-                'language_code': request.language_code
-            }
+            f"{request.first_name} {request.last_name}"
         )
+
+               
         
-        if success:
+        if success.get("success"):
             # Create session
             user_data = {
                 'user_id': auth_result['user_id'],
@@ -509,11 +621,13 @@ async def check_authentication(request: AuthCheckRequest) -> Dict[str, Any]:
         if user_data is None:
             # No linked telegram user
             if request.supabase_user_id:
+                
+                print("Trying to link:",request)
                 # Try to authenticate from database via Supabase Auth
                 # Verify the Supabase ID exists in the auth table and try to link
                 # Here the link still might fail if the supabase_user_id is invalid
-                success = await supabase_client.link_telegram_user(request.supabase_user_id, request.telegram_id, request.user_name)
-                if success:
+                result = await supabase_client.link_telegram_user(request.supabase_user_id, request.telegram_id, request.user_name)
+                if result.get("success"):
                     user_data = await supabase_client.get_user_by_telegram_id_auth(request.telegram_id)
                     is_authenticated = user_data.get("authenticated", False) if user_data else False
                     if is_authenticated and user_data:
@@ -535,9 +649,11 @@ async def check_authentication(request: AuthCheckRequest) -> Dict[str, Any]:
                         "user_data": None,
                         "message": MESSAGES["link_failed"]
                     }
-            else:
+            else:# First time user - not linked and no supabase_user_id provided
+                #Means user doesnt have installed the app nor have registered
                 # No supabase_user_id provided, cannot link
                 # This means the user is not registered
+                print(f"⚠️ User {request.telegram_id} not registered and no supabase_user_id provided")
                 return {
                     "success": False,
                     "authenticated": False,
@@ -551,6 +667,7 @@ async def check_authentication(request: AuthCheckRequest) -> Dict[str, Any]:
             if is_authenticated:
                 # Validate and complete user_data
                 user_data = await _validate_and_complete_user_data(user_data, request.telegram_id)
+                session_manager.create_session(request.telegram_id, user_data)
                 return {
                     "success": True,
                     "authenticated": True,
@@ -660,10 +777,10 @@ async def check_and_consume_credits(user_id: str, operation_type: str, credits_n
                 credits_available=credits_available,
                 credits_needed=credits_needed
             )
-            
-            raise HTTPException(status_code=402, detail=error_msg)
-        else:
-            raise HTTPException(status_code=400, detail=result.get('message', 'Credit operation failed'))
+            return {
+                "success": False,
+                "message": error_msg
+            }
     
     return result
 

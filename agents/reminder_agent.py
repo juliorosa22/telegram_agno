@@ -6,18 +6,18 @@ from typing import Dict, Any, Optional
 import asyncio  # <-- 1. IMPORT ASYNCIO
 from agno.models.groq import Groq
 # Fix: Use package imports from __init__.py
-from tools import Reminder, ReminderType, Priority
+from tools import Reminder, ReminderType, Priority, SupabaseClient
 
 class ReminderAgent:
     """Specialized agent for handling reminders and tasks"""
-    
-    def __init__(self, supabase_client):
+
+    def __init__(self, supabase_client: SupabaseClient):
         self.supabase_client = supabase_client
         
         # Initialize Agno agent for reminder processing
         self.agent = Agent(
             name="ReminderProcessor",
-            model="gpt-4",
+            model=Groq(id="llama-3.3-70b-versatile", temperature=0.2),
             instructions="""
             You are a reminder and task management specialist.
             

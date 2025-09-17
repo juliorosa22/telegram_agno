@@ -7,7 +7,7 @@ from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions
 from gotrue.errors import AuthApiError
 import json
-
+import stripe
 
 class SupabaseClient:
     """Supabase client for direct database operations"""
@@ -16,7 +16,9 @@ class SupabaseClient:
         self.supabase_url = supabase_url
         self.supabase_key = supabase_key
         self.supabase: Client = create_client(supabase_url, supabase_key)
-        
+
+        stripe.api_key = os.getenv("STRIPE_API_KEY")
+
         # Get database URL from environment
         database_url = os.getenv('DATABASE_URL')
         if not database_url:
@@ -147,9 +149,9 @@ class SupabaseClient:
                         last_bot_interaction = NOW(),
                         updated_at = NOW()
                 """, supabase_user_id, telegram_id, user_name)
-                print(f"inserted {user_name}")
-                print(f"✅ Linked Telegram user {telegram_id} to Supabase user {supabase_user_id}")
-                
+            print(f"inserted {user_name}")
+            return {"success": True, "message": f"✅ Linked Telegram user {telegram_id} to Supabase user {supabase_user_id}"}
+    
         except Exception as e:
             print(f"❌ Error linking Telegram user: {e}")
             raise
@@ -229,41 +231,97 @@ class SupabaseClient:
         """Get user payment history"""
         if not self.connected:
             await self.connect()
-        
+        #TODO must implement get_user_payments in database.py
         return await self.database.get_user_payments(user_id)
 
-    # PayPal webhook handler
-    async def handle_paypal_webhook(self, webhook_data: Dict[str, Any]) -> bool:
-        """Handle PayPal payment webhook"""
+    # --- 3. REWRITE create_upgrade_link for Stripe ---
+    async def create_upgrade_link(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Creates a Stripe Checkout Session and returns the approval link."""
         try:
-            if not self.connected:
-                await self.connect()
+            user_id = user_data["user_id"]
+            currency = user_data.get("currency", "USD")
             
-            event_type = webhook_data.get('event_type')
-            resource = webhook_data.get('resource', {})
-            
-            # Extract payment ID from custom field
-            custom_data = resource.get('custom', '')
-            if not custom_data:
-                print("❌ No payment ID in PayPal webhook")
-                return False
-            
-            payment_id = custom_data
-            transaction_id = resource.get('id')
-            
-            if event_type == 'PAYMENT.SALE.COMPLETED':
-                await self.process_payment_success(payment_id, transaction_id)
-                return True
-            elif event_type in ['PAYMENT.SALE.DENIED', 'PAYMENT.SALE.CANCELLED']:
-                await self.process_payment_failure(payment_id, "cancelled")
-                return True
-            
-            return False
-            
+            # 1. Create a 'pending' payment record in our database.
+            payment_id = await self.database.create_payment(
+                user_id=user_id,
+                provider="stripe", # Set provider to stripe
+                amount=5.99, # Your standard price
+                currency=currency
+            )
+
+            if not payment_id:
+                return {"success": False, "message": "Failed to create payment record."}
+
+            # 2. Create a Stripe Checkout Session
+            price_id = os.getenv("STRIPE_PRICE_ID")
+            bot_username = os.getenv("TELEGRAM_BOT_USERNAME", "")
+            success_url = f"https://t.me/{bot_username}?start=payment_success"
+            cancel_url = f"https://t.me/{bot_username}?start=payment_cancelled"
+
+            checkout_session = stripe.checkout.Session.create(
+                line_items=[{'price': price_id, 'quantity': 1}],
+                mode='subscription',
+                success_url=success_url,
+                cancel_url=cancel_url,
+                # This is CRUCIAL for linking the Stripe session back to our database
+                client_reference_id=payment_id,
+            )
+
+            return {
+                "success": True,
+                "payment_id": payment_id,
+                "stripe_url": checkout_session.url # Return the Stripe URL
+            }
         except Exception as e:
-            print(f"❌ Error processing PayPal webhook: {e}")
+            print(f"❌ Error creating Stripe upgrade link: {e}")
+            return {"success": False, "message": str(e)}
+
+
+    
+    async def handle_stripe_webhook(self, payload: bytes, sig_header: str) -> bool:
+        """Handle Stripe payment webhook"""
+        webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+        if not webhook_secret:
+            print("❌ Stripe webhook secret is not configured.")
             return False
 
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload, sig_header=sig_header, secret=webhook_secret
+            )
+        except ValueError as e:
+            # Invalid payload
+            print(f"❌ Invalid webhook payload: {e}")
+            return False
+        except stripe.error.SignatureVerificationError as e:
+            # Invalid signature
+            print(f"❌ Invalid webhook signature: {e}")
+            return False
+
+        # Handle the checkout.session.completed event
+        if event['type'] == 'checkout.session.completed':
+            session = event['data']['object']
+            
+            # Extract the IDs we need
+            payment_id = session.get('client_reference_id')
+            subscription_id = session.get('subscription')
+            customer_id = session.get('customer') # Stripe customer ID
+
+            if not payment_id:
+                print("❌ Webhook received without a client_reference_id (payment_id).")
+                return False
+
+            print(f"✅ checkout.session.completed for payment_id: {payment_id}")
+            
+            # Update our database
+            await self.process_payment_success(payment_id, customer_id, subscription_id)
+            return True
+            
+        else:
+            print(f"ℹ️ Received unhandled Stripe event type: {event['type']}")
+            return True # Return True to acknowledge receipt of the event
+        return False
+    
     async def sign_up_user_with_auth(self, email: str, password: str, user_metadata: Dict[str, Any] = None) -> Dict[str, Any]:
         """Sign up user with Supabase Auth"""
         try:
@@ -341,14 +399,6 @@ class SupabaseClient:
                         last_bot_interaction = NOW(),
                         updated_at = NOW()
                 """, auth_user_id, telegram_id)
-                
-                # Log activity
-                await self.database._log_user_activity(
-                    auth_user_id,
-                    'telegram_linked',
-                    {'telegram_id': telegram_id, **telegram_data},
-                    'telegram'
-                )
             
             return True
             
@@ -498,6 +548,9 @@ class SupabaseClient:
         except Exception as e:
             print(f"❌ Error ensuring user exists: {e}")
             return {"success": False, "message": "❌ Internal error. Please try again later."}
+
+
+
 
     async def check_user_by_baseid(self, supabase_user_id: str) -> bool:
         """Check if user exists in Supabase Auth by user ID"""

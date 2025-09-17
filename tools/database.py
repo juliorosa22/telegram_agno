@@ -141,7 +141,7 @@ class Database:
                     is_premium BOOLEAN DEFAULT FALSE NOT NULL,
                     telegram_id TEXT UNIQUE,
                     premium_until TIMESTAMPTZ,
-                    freemium_credits INTEGER DEFAULT 30 NOT NULL CHECK (freemium_credits >= 0),
+                    freemium_credits INTEGER DEFAULT 50 NOT NULL CHECK (freemium_credits >= 0),
                     credits_reset_date DATE DEFAULT (CURRENT_DATE + INTERVAL '30 days') NOT NULL,
                     last_bot_interaction TIMESTAMP DEFAULT NOW(),
                     created_at TIMESTAMP DEFAULT NOW() NOT NULL,
@@ -379,7 +379,7 @@ class Database:
                 BEGIN
                     -- Reset credits for non-premium users whose reset date has passed
                     UPDATE user_settings 
-                    SET freemium_credits = 30,
+                    SET freemium_credits = 20,
                         credits_reset_date = CURRENT_DATE + INTERVAL '30 days',
                         updated_at = NOW()
                     WHERE is_premium = FALSE

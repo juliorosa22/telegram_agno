@@ -15,8 +15,7 @@ load_dotenv()
 
 # Conversation states for registration
 REGISTER_EMAIL, REGISTER_NAME, REGISTER_LASTNAME, REGISTER_CONFIRM = range(4)
-# Add new conversation state
-START_EMAIL = 1
+SUPPORT_MESSAGE = range(4, 5) # State for support conversation
 
 class AgnoTelegramBot:
     """Telegram bot with session-based authentication"""
@@ -25,6 +24,7 @@ class AgnoTelegramBot:
         # Load environment variables
         self.token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.api_url = api_url or os.getenv('API_SERVICE_URL', 'http://localhost:8000')
+        self.support_chat_id = os.getenv('SUPPORT_CHAT_ID') # <-- 2. Load the support chat ID
         
         # Validate required environment variables
         if not self.token:
@@ -53,15 +53,29 @@ class AgnoTelegramBot:
         )
         self.app.add_handler(registration_handler)
         
-        # NEW: Add /start conversation for email input
-        start_handler = ConversationHandler(
-            entry_points=[CommandHandler("start", self.start_command)],
+        # --- 1. Define and add the support conversation handler ---
+        support_handler = ConversationHandler(
+            entry_points=[CommandHandler("support", self.support_start)],
             states={
-                START_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.start_email)],
+                SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.support_message)],
             },
-            fallbacks=[CommandHandler("cancel", self.start_cancel)],
+            fallbacks=[CommandHandler("cancel", self.support_cancel)],
         )
-        self.app.add_handler(start_handler)
+        self.app.add_handler(support_handler)
+
+        # --- 2. REMOVE the entire /start ConversationHandler ---
+        # NEW: Add /start conversation for email input
+        # start_handler = ConversationHandler(
+        #     entry_points=[CommandHandler("start", self.start_command)],
+        #     states={
+        #         START_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.start_email)],
+        #     },
+        #     fallbacks=[CommandHandler("cancel", self.start_cancel)],
+        # )
+        # self.app.add_handler(start_handler)
+        
+        # NEW: Add /upgrade command handler
+        self.app.add_handler(CommandHandler("upgrade", self.upgrade_command))
         
         # Command handlers
         self.app.add_handler(CommandHandler("start", self.start_command))
@@ -191,7 +205,7 @@ class AgnoTelegramBot:
                             "email": data["email"],
                             "first_name": data["first_name"],
                             "last_name": data.get("last_name"),
-                            "language_code": data["language_code"],
+                            "language_code": data["language_code"], # Already here, which is great!
                             "timezone": "UTC",
                             "currency": "USD"
                         }
@@ -267,7 +281,8 @@ class AgnoTelegramBot:
                     json={
                         "user_id": str(user.id),
                         "user_data": user.to_dict(),
-                        "args": args
+                        "args": args,
+                        "language_code": user.language_code # <-- Pass language
                     }
                 ) as response:
                     result = await response.json()
@@ -276,42 +291,102 @@ class AgnoTelegramBot:
             print(f"❌ Error in start command: {e}")
             await update.message.reply_text("❌ Welcome! There was an issue connecting to the service.")
         
-        return ConversationHandler.END
-    
-    async def start_email(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle email input for direct auth"""
-        email = update.message.text.strip()
+        # --- 3. REMOVE the return value ---
+        # return ConversationHandler.END
+
+    async def upgrade_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle the /upgrade command to get a premium payment link."""
         user = update.effective_user
-        
-        # Basic validation
-        if "@" not in email or "." not in email:
-            await update.message.reply_text("❌ Please enter a valid email address.")
-            return START_EMAIL
-        
-        # Send to API with email for auth
+        telegram_id = str(user.id)
+        print(f"🚀 /upgrade command from {user.first_name}")
+
+        await update.message.reply_text("⏳ Generating your personal upgrade link, please wait...")
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{self.api_url}/api/v1/start",
-                    json={
-                        "user_id": str(user.id),
-                        "user_data": user.to_dict(),
-                        "email": email  # NEW: Pass email
-                    }
+                    f"{self.api_url}/api/v1/upgrade",
+                    json={"user_id": telegram_id}
                 ) as response:
                     result = await response.json()
-                    await update.message.reply_text(result["message"], parse_mode='Markdown', disable_web_page_preview=True)
+                    message = result.get("message", "An error occurred.")
+
+                    if response.status == 200 and result.get("success"):
+                        # Success! The message from the API will contain the payment link.
+                        await update.message.reply_text(
+                            message,
+                            parse_mode='Markdown',
+                            disable_web_page_preview=False # Ensure the link preview shows
+                        )
+                    elif response.status == 401:
+                        await update.message.reply_text(
+                            "🔐 You need to be registered to upgrade.\n"
+                            "Type /register to create your account first, then try /upgrade again.",
+                            parse_mode='Markdown'
+                        )
+                    else:
+                        # Handle other errors, like user is already premium
+                        await update.message.reply_text(message)
+
         except Exception as e:
-            print(f"❌ Error in email auth: {e}")
-            await update.message.reply_text("❌ Sorry, there was an issue. Try /register instead.")
-        
-        return ConversationHandler.END
-    
-    async def start_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Cancel /start email input"""
-        await update.message.reply_text("❌ Cancelled. Type /start to try again or /register to create an account.")
+            print(f"❌ Error in upgrade command: {e}")
+            await update.message.reply_text("❌ Sorry, there was a problem generating your upgrade link. Please try again later.")
+
+
+
+    # --- 2. Add the support conversation methods ---
+
+    async def support_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Starts the support conversation."""
+        await update.message.reply_text(
+            "🛠️ *Support Mode*\n\n"
+            "Please describe your issue in detail. Your message will be sent directly to our support team.\n\n"
+            "Type /cancel to exit support mode.",
+            parse_mode='Markdown'
+        )
+        return SUPPORT_MESSAGE
+
+    async def support_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Forwards the user's support message."""
+        user = update.effective_user
+        message_text = update.message.text
+
+        if not self.support_chat_id:
+            print("⚠️ SUPPORT_CHAT_ID is not set. Cannot forward message.")
+            await update.message.reply_text("❌ We're sorry, the support system is currently unavailable. Please try again later.")
+            return ConversationHandler.END
+        print("support id:", self.support_chat_id)
+        # Format the message with user details
+        forward_message = (
+            f"**New Support Request**\n\n"
+            f"**From:** {user.first_name} {user.last_name or ''}\n"
+            f"**User ID:** `{user.id}`\n"
+            f"**Username:** @{user.username or 'N/A'}\n\n"
+            f"--- Message ---\n"
+            f"{message_text}"
+        )
+        print(forward_message)
+        try:
+            # Send the formatted message to your private support channel
+            await self.app.bot.send_message(
+                chat_id=self.support_chat_id,
+                text=forward_message,
+                parse_mode='Markdown'
+            )
+            await update.message.reply_text(
+                "✅ **Message Sent!**\n\n"
+                "Thank you. Our support team has received your message and will get back to you as soon as possible."
+            )
+        except Exception as e:
+            print(f"❌ Failed to forward support message: {e}")
+            await update.message.reply_text("❌ There was an error sending your message. Please try again.")
+
         return ConversationHandler.END
 
+    async def support_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Cancels the support conversation."""
+        await update.message.reply_text("Support request cancelled.")
+        return ConversationHandler.END
    
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -329,7 +404,8 @@ class AgnoTelegramBot:
                     json={
                         "user_id": telegram_id,
                         "message": message,
-                        "user_data": user.to_dict()
+                        "user_data": user.to_dict(),
+                        "language_code": user.language_code # <-- Pass language
                     }
                 ) as response:
                     if response.status == 200:
@@ -357,11 +433,15 @@ class AgnoTelegramBot:
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
-        print(f"ℹ️ /help command from {update.effective_user.first_name}")
+        user = update.effective_user
+        print(f"ℹ️ /help command from {user.first_name}")
         
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.api_url}/api/v1/help") as response:
+                async with session.get(
+                    f"{self.api_url}/api/v1/help",
+                    params={"language_code": user.language_code} # <-- Pass language
+                ) as response:
                     if response.status == 200:
                         result = await response.json()
                         await update.message.reply_text(result["message"], parse_mode='Markdown')
@@ -556,9 +636,11 @@ class AgnoTelegramBot:
             BotCommand("balance", "View financial summary"),
             BotCommand("reminders", "Show pending reminders"),
             BotCommand("profile", "View your profile"),
+            BotCommand("upgrade", "Upgrade to Premium"),
+            BotCommand("support", "Contact customer support"), # <-- 3. Add support command to menu
         ]
         await self.app.bot.set_my_commands(commands)
-    
+
     async def run(self):
         """Start the bot"""
         if not self.app:

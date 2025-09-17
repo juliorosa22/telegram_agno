@@ -3,13 +3,14 @@ import re
 from typing import Dict, Any
 import asyncio  # <-- 1. IMPORT ASYNCIO
 from agno.models.groq import Groq
+from messages import  MESSAGES, get_message
 # Fix: Use package imports
-from tools import Transaction, Reminder  # Import from package __init__.py
+from tools import SupabaseClient
 
 class MainAgent:
     """Main agent that handles user management and routes messages to specialized agents"""
-    
-    def __init__(self, supabase_client):
+
+    def __init__(self, supabase_client: SupabaseClient):
         self.supabase_client = supabase_client
         
         # Initialize Agno agent for intent classification
@@ -37,14 +38,16 @@ class MainAgent:
     
     async def route_message(self, user_id: str, message: str, user_data: Dict[str, Any]) -> str:
         """Route user message to appropriate agent based on intent - NO AUTH CHECK"""
+        lang_map = {'es': 'Spanish', 'pt': 'Portuguese', 'en': 'English'}
+        lang = user_data.get('language', 'en')
+        lang_name = lang_map.get(lang.split('-')[0], 'English')
         try:
             # User is already authenticated at this point (checked in API layer)
-            print("before passing to groq")
-
+           
             # --- 2. RUN THE BLOCKING CALL IN A SEPARATE THREAD ---
             intent_response_obj = await asyncio.to_thread(
                 self.agent.run,
-                f"Classify this user message and explain briefly: '{message}'"
+                f"The user is speaking {lang_name}. Classify this user message and explain briefly: '{message}'"
             )
             intent_response = str(intent_response_obj)
 
@@ -53,83 +56,46 @@ class MainAgent:
             if self._contains_intent(intent_response, "TRANSACTION"):
                 from .transaction_agent import TransactionAgent
                 transaction_agent = TransactionAgent(self.supabase_client)
-                return await transaction_agent.process_message(user_id, message)
+                return await transaction_agent.process_message(user_id, message, lang_name)
                 
             elif self._contains_intent(intent_response, "REMINDER"):
                 from .reminder_agent import ReminderAgent
                 reminder_agent = ReminderAgent(self.supabase_client)
-                return await reminder_agent.process_message(user_id, message)
-                
+                return await reminder_agent.process_message(user_id, message, lang_name)
+
             elif self._contains_intent(intent_response, "SUMMARY"):
                 from .transaction_agent import TransactionAgent
                 transaction_agent = TransactionAgent(self.supabase_client)
-                return await transaction_agent.get_summary(user_id)
+                return await transaction_agent.get_summary(user_id, lang_name)
                 
             elif self._contains_intent(intent_response, "HELP"):
                 # Return help content directly (no auth needed here)
-                return self._get_help_content()
-                
+                return self._get_help_content(lang)
+
             else:
                 # General conversation
                 # --- 3. APPLY THE FIX HERE AS WELL ---
                 general_response_obj = await asyncio.to_thread(
                     self.agent.run,
-                    f"Respond helpfully to this message about financial tracking: '{message}'. "
+                    f"The user is speaking {lang_name}. Respond helpfully in {lang_name} to this message: '{message}'. "
                     "Suggest how they can use the assistant for their financial needs."
                 )
                 return str(general_response_obj)
                 
         except Exception as e:
             #print("failed to route message")
-            print(f"❌ Error routing message: {e}")
+            print(f"❌ Main Agent: Error routing message: {e}")
             return "❌ Sorry, I encountered an error. Please try rephrasing your request."
-    
-    def _get_help_content(self) -> str:
+
+    def _get_help_content(self, lang: str = 'en') -> str:
         """Return help content without authentication"""
-        return """
-🤖 *OkanAssist AI - Agno Powered*
+        return get_message("help_message", lang)
 
-*💰 Expense Tracking:*
-• "Spent $25 on lunch at McDonald's"
-• "Paid $1200 rent"
-• "Bought groceries for $85"
-• 📸 Send receipt photos for automatic processing
-
-*💵 Income Tracking:*
-• "Received $3000 salary"
-• "Got $50 freelance payment"
-• "Earned $200 from side project"
-
-*⏰ Reminders:*
-• "Remind me to pay bills tomorrow at 3pm"
-• "Set reminder: doctor appointment next Friday"
-• "Don't forget to call mom this weekend"
-
-*📊 Financial Views:*
-• /balance - View financial summary
-• /reminders - Show pending reminders
-• "Show expenses this week"
-• "What's my spending pattern?"
-
-*📄 Document Processing:*
-• Send PDF bank statements for bulk import
-• Receipt photos are automatically processed
-• Invoices and bills can be analyzed
-
-*🎯 Commands:*
-/start - Get started
-/help - Show this help
-/balance - Financial summary
-/reminders - View reminders
-
-*Powered by Agno Framework with GPT-4 Vision*
-Just talk to me naturally - I understand! 🎉
-        """
-    
     def _contains_intent(self, response: str, intent: str) -> bool:
         """Check if the response contains the specified intent"""
         return intent.lower() in response.lower()
     
+    #TODO expand keybord lists to handle similar words in different languages
     async def classify_intent(self, message: str) -> str:
         """Classify message intent using simple keyword matching as fallback"""
         message_lower = message.lower()
