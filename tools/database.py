@@ -727,28 +727,20 @@ class Database:
             result = await conn.fetchrow("""
                 INSERT INTO user_settings (
                     user_id, name, currency, language, timezone, 
-                    is_premium, telegram_id, premium_until, freemium_credits, 
-                    credits_reset_date, last_bot_interaction
+                    telegram_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (user_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     currency = EXCLUDED.currency,
                     language = EXCLUDED.language,
-                    timezone = EXCLUDED.timezone,
-                    is_premium = EXCLUDED.is_premium,
-                    telegram_id = EXCLUDED.telegram_id,
-                    premium_until = EXCLUDED.premium_until,
-                    freemium_credits = EXCLUDED.freemium_credits,
-                    credits_reset_date = EXCLUDED.credits_reset_date,
-                    last_bot_interaction = EXCLUDED.last_bot_interaction,
+                    timezone = EXCLUDED.timezone,                    
+                    telegram_id = EXCLUDED.telegram_id,                    
                     updated_at = NOW()
                 RETURNING *
             """, 
             settings.user_id, settings.name, settings.currency, settings.language, 
-            settings.timezone, settings.is_premium, settings.telegram_id, 
-            settings.premium_until, settings.freemium_credits, settings.credits_reset_date,
-            settings.last_bot_interaction
+            settings.timezone, settings.telegram_id
             )
             
             return UserSettings(

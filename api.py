@@ -457,32 +457,36 @@ async def register_user(request: RegisterRequest):
     try:
         if not supabase_client or not timezone_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
-        #first verifies if the user is already registered
-        user_data = get_user_data(AuthCheckRequest(telegram_id=request.telegram_id))
+        
+        # Try to check if the user is already registered/authenticated
+        user_data = None
+        try:
+            user_data = await get_user_data(AuthCheckRequest(telegram_id=request.telegram_id))
+        except HTTPException as e:
+            # Only continue registration if user not found (401 or 404)
+            if e.status_code not in (401, 404):
+                raise  # Re-raise other errors (service unavailable, etc.)
+            user_data = None  # Explicitly set to None for clarity
+
         if user_data:
             return {
                 "success": False, 
-                "message": get_message("already_registered", lang_code)#MESSAGES["already_registered"]
+                "message": get_message("already_registered", lang_code)
             }
-        #continue the registration process
-        # --- 1. Use the TimezoneAgent with the correct arguments ---
+        
+        # --- Registration process continues here ---
         raw_timezone_input = request.timezone
-        # The agent now requires language and returns a tuple: (iana_name, utc_offset)
         processed_timezone, utc_offset = await timezone_agent.identify_timezone(
             language=lang_code, 
             text_input=raw_timezone_input
         )
         print(f"Processed timezone: {processed_timezone}, UTC offset: {utc_offset}")
 
-        
-        # --- 2. Validate the agent's output and default to 'UTC' on failure ---
         if not processed_timezone:
             print(f"⚠️ Timezone identification failed for input '{raw_timezone_input}'. Defaulting to UTC.")
             processed_timezone = "UTC"
-        # Infer currency
         inferred_currency = infer_currency(processed_timezone)
         print(f"Inferred currency: {inferred_currency}")
-        # --- (The rest of the function proceeds, using `processed_timezone` for storage) ---
         
         # Create new user in Supabase Auth
         auth_result = await supabase_client.sign_up_user_with_auth(
@@ -502,11 +506,11 @@ async def register_user(request: RegisterRequest):
                 "message": get_message("registration_failed", lang_code, message=auth_result['message'])
             }
         
-
         # Create user settings in the database and already link telegram_id
-        result=await supabase_client.create_new_user_settings(
+        result = await supabase_client.create_new_user_settings(
             auth_result['user_id'],
-            {   'name': request.name,
+            {
+                'name': request.name,
                 'telegram_id': request.telegram_id,
                 'language': request.language_code,
                 'timezone': processed_timezone,
@@ -515,21 +519,19 @@ async def register_user(request: RegisterRequest):
         )
 
         if result.get("success"):
-            # Create session
             user_data = {
                 'user_id': auth_result['user_id'],
                 'email': request.email,
                 'name': request.name,
                 'currency': inferred_currency,
                 'language': request.language_code,
-                'timezone': processed_timezone, # Use processed IANA name
+                'timezone': processed_timezone,
                 'is_premium': False,
                 'premium_until': None,
                 'telegram_id': request.telegram_id,
                 'authenticated': True
             }
             session_manager.create_session(request.telegram_id, user_data)
-            
             return {
                 "success": True,
                 "message": get_message("registration_success", lang_code, name=request.name, password=auth_result['password'], download_url=os.getenv("APP_DOWNLOAD_URL", "https://play.google.com/store/apps/details?id=com.okanassist")),
