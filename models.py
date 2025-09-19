@@ -37,14 +37,18 @@ class UserCheckRequest(BaseModel):
 class RegisterRequest(BaseModel):
     telegram_id: str
     email: str
-    first_name: str
-    last_name: Optional[str] = None
-    language_code: str = "en"
+    name: str #includes first name and last name
+    language_code: Optional[str] = "en"
+    timezone: Optional[str] = "UTC"
+    currency: Optional[str] = "USD"
 
 class AuthCheckRequest(BaseModel):
     telegram_id: str
     user_name: Optional[str] = None
     supabase_user_id: Optional[str] = None
+    language: Optional[str] = "en"
+    timezone: Optional[str] = "UTC"
+    currency: Optional[str] = "USD"
 
 class UpgradeRequest(BaseModel):
     user_id: str

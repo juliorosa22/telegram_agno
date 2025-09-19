@@ -99,7 +99,7 @@ class TransactionAgent:
             
             response_obj = await asyncio.to_thread(self.text_agent.run, extraction_prompt)
             response = response_obj.content # <-- FIX: Access the .content attribute
-            print("Raw response from Groq:", response)
+            #print("Raw response from Groq:", response)
             # Enhanced JSON parsing for Groq responses
             try:
                 # Clean response to extract JSON
@@ -120,7 +120,7 @@ class TransactionAgent:
             # Validate and fix category
             validated_category = self._validate_category(data["category"], data["transaction_type"])
             data["category"] = validated_category
-            print("Extracted data:", data)
+            #print("Extracted data:", data)
             # Create and save transaction
             transaction = Transaction(
                 user_id=user_id,

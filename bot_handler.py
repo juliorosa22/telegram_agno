@@ -2,20 +2,22 @@ import os
 import asyncio
 import aiohttp
 import tempfile
+import pytz # <-- 1. Import pytz
 from typing import Optional, Dict, Any
 from telegram import Update, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, 
     ContextTypes, ConversationHandler
 )
+from telegram.helpers import escape_markdown # <-- 1. Import the escape helper
 from dotenv import load_dotenv
 
 # Load environment variables first
 load_dotenv()
 
 # Conversation states for registration
-REGISTER_EMAIL, REGISTER_NAME, REGISTER_LASTNAME, REGISTER_CONFIRM = range(4)
-SUPPORT_MESSAGE = range(4, 5) # State for support conversation
+REGISTER_EMAIL, REGISTER_NAME, REGISTER_LASTNAME, REGISTER_TIMEZONE, REGISTER_CONFIRM = range(5) # <-- 2. Add new state
+SUPPORT_MESSAGE = range(5, 6)
 
 class AgnoTelegramBot:
     """Telegram bot with session-based authentication"""
@@ -45,9 +47,20 @@ class AgnoTelegramBot:
             entry_points=[CommandHandler("register", self.register_start)],
             states={
                 REGISTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.register_email)],
-                REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.register_name)],
-                REGISTER_LASTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.register_lastname)],
-                REGISTER_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.register_confirm)],
+                # --- 1. Handle /skip command explicitly ---
+                REGISTER_NAME: [
+                    CommandHandler("skip", self.register_name),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.register_name)
+                ],
+                REGISTER_LASTNAME: [
+                    CommandHandler("skip", self.register_lastname),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.register_lastname)
+                ],
+                REGISTER_TIMEZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.register_timezone)],
+                REGISTER_CONFIRM: [
+                    CommandHandler("confirm", self.register_confirm),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.register_invalid_confirm_input)
+                ],
             },
             fallbacks=[CommandHandler("cancel", self.register_cancel)],
         )
@@ -63,18 +76,7 @@ class AgnoTelegramBot:
         )
         self.app.add_handler(support_handler)
 
-        # --- 2. REMOVE the entire /start ConversationHandler ---
-        # NEW: Add /start conversation for email input
-        # start_handler = ConversationHandler(
-        #     entry_points=[CommandHandler("start", self.start_command)],
-        #     states={
-        #         START_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.start_email)],
-        #     },
-        #     fallbacks=[CommandHandler("cancel", self.start_cancel)],
-        # )
-        # self.app.add_handler(start_handler)
-        
-        # NEW: Add /upgrade command handler
+ 
         self.app.add_handler(CommandHandler("upgrade", self.upgrade_command))
         
         # Command handlers
@@ -147,7 +149,8 @@ class AgnoTelegramBot:
         """Handle first name input"""
         telegram_id = str(update.effective_user.id)
         
-        if update.message.text.strip().lower() != "/skip":
+        # --- 2. Check if the input is NOT a command before updating ---
+        if not update.message.text.startswith('/'):
             first_name = update.message.text.strip()
             self.registration_data[telegram_id]["first_name"] = first_name
         
@@ -162,12 +165,38 @@ class AgnoTelegramBot:
         """Handle last name input"""
         telegram_id = str(update.effective_user.id)
         
-        if update.message.text.strip().lower() != "/skip":
+        # --- 2. Check if the input is NOT a command before updating ---
+        if not update.message.text.startswith('/'):
             last_name = update.message.text.strip()
             self.registration_data[telegram_id]["last_name"] = last_name
         
-        # Show confirmation
+        # --- 1. Update the prompt to encourage natural language ---
+        await update.message.reply_text(
+            "🕒 *What is your timezone?*\n\n"
+            "You can say things like `New York`, `London`, `pacific time`, or `GMT+2`.\n\n"
+            "This is crucial for reminders to be accurate.",
+            parse_mode='Markdown'
+        )
+        
+        return REGISTER_TIMEZONE
+
+    # --- 2. Simplify the timezone handler ---
+    async def register_timezone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle timezone input by capturing the raw text."""
+        timezone_input = update.message.text.strip()
+        telegram_id = str(update.effective_user.id)
+
+        # Store the raw text. The API will process it.
+        self.registration_data[telegram_id]["timezone"] = timezone_input
+        
+        # Immediately proceed to the confirmation step
+        return await self.show_registration_confirmation(update, context)
+
+    async def show_registration_confirmation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Helper function to display the final confirmation message."""
+        telegram_id = str(update.effective_user.id)
         data = self.registration_data[telegram_id]
+        
         confirmation_text = (
             "📋 *Please confirm your details:*\n\n"
             f"📧 Email: {data['email']}\n"
@@ -177,73 +206,67 @@ class AgnoTelegramBot:
         if data.get("last_name"):
             confirmation_text += f" {data['last_name']}"
         
+        # --- 2. Update the prompt to use commands ---
         confirmation_text += (
-            f"\n🌐 Language: {data['language_code']}\n\n"
-            "*Type 'confirm' to create your account*\n"
-            "*Type 'cancel' to start over*"
+            f"\n🌐 Language: {data['language_code']}\n"
+            f"🕒 Timezone: {data['timezone']}  _(I will interpret this automatically)_\n\n"
+            "Type /confirm to create your account.\n\n\n"
+            "Type /cancel to start over."
         )
         
         await update.message.reply_text(confirmation_text, parse_mode='Markdown')
-        
         return REGISTER_CONFIRM
-    
+
+    # --- 3. Refactor the confirmation logic ---
     async def register_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle registration confirmation"""
-        user_input = update.message.text.strip().lower()
+        """Handle the /confirm command to finalize registration."""
         telegram_id = str(update.effective_user.id)
         
-        if user_input == "confirm":
-            # Submit registration to API
-            try:
-                data = self.registration_data[telegram_id]
-                
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        f"{self.api_url}/api/v1/register",
-                        json={
-                            "telegram_id": data["telegram_id"],
-                            "email": data["email"],
-                            "first_name": data["first_name"],
-                            "last_name": data.get("last_name"),
-                            "language_code": data["language_code"], # Already here, which is great!
-                            "timezone": "UTC",
-                            "currency": "USD"
-                        }
-                    ) as response:
-                        result = await response.json()
-                        
-                        if response.status == 200 and result.get("success"):
-                            await update.message.reply_text(
-                                result["message"],
-                                parse_mode='Markdown'
-                            )
-                        else:
-                            await update.message.reply_text(
-                                f"❌ Registration failed: {result.get('message', 'Unknown error')}"
-                            )
-                
-                # Clean up registration data
-                del self.registration_data[telegram_id]
-                
-            except Exception as e:
-                print(f"❌ Error during registration: {e}")
-                await update.message.reply_text(
-                    "❌ Registration failed due to a technical error. Please try again later."
-                )
-        
-        elif user_input == "cancel":
-            await update.message.reply_text(
-                "❌ Registration cancelled. Type /register to start again."
-            )
+        # Submit registration to API
+        try:
+            data = self.registration_data[telegram_id]
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.api_url}/api/v1/register",
+                    json={
+                        "telegram_id": data["telegram_id"],
+                        "email": data["email"],
+                        "name": data["first_name"]+" "+data.get("last_name",""),
+                        "language_code": data["language_code"],
+                        "timezone": data["timezone"],
+                        "currency": "USD"
+                    }
+                ) as response:
+                    result = await response.json()
+                    
+                    if response.status == 200 and result.get("success"):
+                        await update.message.reply_text(
+                            result["message"],
+                            parse_mode='Markdown'
+                        )
+                    else:
+                        await update.message.reply_text(
+                            f"❌ Registration failed: {result.get('message', 'Unknown error')}"
+                        )
+            
+            # Clean up registration data
             del self.registration_data[telegram_id]
-        
-        else:
+            
+        except Exception as e:
+            print(f"❌ Error during registration: {e}")
             await update.message.reply_text(
-                "Please type 'confirm' to create your account or 'cancel' to stop."
+                "❌ Registration failed due to a technical error. Please try again later."
             )
-            return REGISTER_CONFIRM
         
         return ConversationHandler.END
+
+    async def register_invalid_confirm_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handles any input that is not /confirm or /cancel at the final step."""
+        await update.message.reply_text(
+            "Please use /confirm to create your account or /cancel to stop."
+        )
+        return REGISTER_CONFIRM
     
     async def register_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel registration"""
@@ -264,15 +287,29 @@ class AgnoTelegramBot:
         """Handle /start command by calling the API's handle_start directly"""
         user = update.effective_user
         args = context.args
-        
+        print(f"context received:{args}")
         print(f"👤 /start command from {user.first_name} ({user.id})")
         
-        # Check if user has passed a Supabase ID from mobile app redirect
+        # Handle payment status or Supabase ID
         if args and len(args) > 0:
-            supabase_user_id = args[0]
-            print(f"📱 Redirect from mobile app with Supabase ID: {supabase_user_id}")
-            # Proceed to call API with the Supabase ID in args
-    
+
+            if args[0]=="payment_success":
+                await update.message.reply_text(
+                    "✅ Payment successful! You now have premium access. Type /profile to check your status.",
+                    parse_mode='Markdown'
+                )
+                return
+            elif args[0]=="payment_cancelled":
+                await update.message.reply_text(
+                    "❌ Payment was cancelled. You can try again with /upgrade.",
+                    parse_mode='Markdown'
+                )
+                return
+            else:
+                supabase_user_id = args[0]               
+                print(f"📱 Redirect from mobile app with data: {supabase_user_id}")
+                # Optionally, you can call your API with the Supabase ID here if needed
+        
         # Always call the API's /api/v1/start endpoint - let the API handle authentication and responses
         try:
             async with aiohttp.ClientSession() as session:
@@ -612,7 +649,30 @@ class AgnoTelegramBot:
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        await update.message.reply_text(result["message"], parse_mode='Markdown')
+                        print(result)
+                        user_data = result.get("user_data", {})
+
+                        # --- 2. Build and escape the message here ---
+                        # Use escape_markdown(text, version=2) for V2 Markdown
+                        email = escape_markdown(user_data.get('email', 'Not set'), version=2)
+                        name = escape_markdown(user_data.get('name', 'Unknown'), version=2)
+                        
+                        language = escape_markdown(user_data.get('language', 'en'), version=2)
+                        currency = escape_markdown(user_data.get('currency', 'USD'), version=2)
+                        timezone = escape_markdown(user_data.get('timezone', 'UTC'), version=2)
+                        premium_status = 'Yes' if user_data.get('is_premium') else 'No'
+
+                        profile_message = (
+                            f"👤 *Your Profile*\n\n"
+                            f"📧 Email: `{email}`\n"
+                            f"👤 Name: {name}\n"
+                            f"🌐 Language: {language}\n"
+                            f"💰 Currency: {currency}\n"
+                            f"⏰ Timezone: `{timezone}`\n"
+                            f"⭐ Premium: {premium_status}\n"
+                        )
+
+                        await update.message.reply_text(profile_message, parse_mode='MarkdownV2')
                     elif response.status == 401:
                         await update.message.reply_text(
                             "🔐 You need to register first to view your profile!\n"

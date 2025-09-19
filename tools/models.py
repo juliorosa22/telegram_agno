@@ -240,6 +240,7 @@ class UserSettings:
     timezone: str = "UTC"
     is_premium: bool = False
     telegram_id: Optional[str] = None
+    name: Optional[str] = None
     premium_until: Optional[datetime] = None
     freemium_credits: Optional[int] = None
     credits_reset_date: Optional[datetime] = None

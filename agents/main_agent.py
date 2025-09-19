@@ -21,18 +21,19 @@ class MainAgent:
             You are the main coordinator for a personal tracking assistant.
 
             Your role is to:
-            1. Identify user intentions from messages
-            2. Route to appropriate specialized agents
-            3. Provide friendly, helpful responses
+            1. Identify user intentions from messages in multiple languages.
+            2. Route the user's request to the correct internal function.
+            3. Provide friendly, helpful responses if no specific function is needed.
             
-            Classify user messages into these categories:
-            - TRANSACTION: Messages about expenses, income, purchases, payments
-            - REMINDER: Messages about reminders, tasks, scheduling, notifications  
-            - SUMMARY: Requests for summaries, balances, reports
-            - HELP: Help requests, questions about functionality
-            - GREETING: Greetings, casual conversation
+            Classify user messages into ONE of these categories:
+            - TRANSACTION: For logging a new expense or income (e.g., "spent $20 on lunch", "got paid $500").
+            - REMINDER: For creating a new reminder, task, or event (e.g., "remind me to call mom tomorrow").
+            - TRANSACTION_SUMMARY: For requests about financial summaries, balances, spending reports (e.g., "what's my balance?", "show me my expenses this month").
+            - REMINDER_SUMMARY: For requests about schedules, agendas, or lists of upcoming tasks/reminders (e.g., "what's my schedule?", "show me my reminders").
+            - HELP: For help requests or questions about functionality.
+            - GREETING: For simple greetings and casual conversation.
             
-            Respond with the classification and a brief explanation.
+            Respond with ONLY the classification category in uppercase (e.g., "TRANSACTION", "REMINDER_SUMMARY").
             """
         )
     
@@ -41,6 +42,7 @@ class MainAgent:
         lang_map = {'es': 'Spanish', 'pt': 'Portuguese', 'en': 'English'}
         lang = user_data.get('language', 'en')
         lang_name = lang_map.get(lang.split('-')[0], 'English')
+        user_timezone = user_data.get('timezone', 'UTC')
         try:
             # User is already authenticated at this point (checked in API layer)
            
@@ -49,24 +51,31 @@ class MainAgent:
                 self.agent.run,
                 f"The user is speaking {lang_name}. Classify this user message and explain briefly: '{message}'"
             )
-            intent_response = str(intent_response_obj)
-
-            #print("Intent response:", intent_response)
+            intent_response = str(intent_response_obj.content)
+            print("Intent response main agent:", intent_response)
+            
             # Route based on intent classification
             if self._contains_intent(intent_response, "TRANSACTION"):
                 from .transaction_agent import TransactionAgent
                 transaction_agent = TransactionAgent(self.supabase_client)
-                return await transaction_agent.process_message(user_id, message, lang_name)
+                return await transaction_agent.process_message(user_id, message, lang)
                 
             elif self._contains_intent(intent_response, "REMINDER"):
                 from .reminder_agent import ReminderAgent
                 reminder_agent = ReminderAgent(self.supabase_client)
-                return await reminder_agent.process_message(user_id, message, lang_name)
+                return await reminder_agent.process_message(user_id, message, lang, user_timezone)
 
-            elif self._contains_intent(intent_response, "SUMMARY"):
+            # --- 2. Rename SUMMARY to TRANSACTION_SUMMARY ---
+            elif self._contains_intent(intent_response, "TRANSACTION_SUMMARY"):
                 from .transaction_agent import TransactionAgent
                 transaction_agent = TransactionAgent(self.supabase_client)
-                return await transaction_agent.get_summary(user_id, lang_name)
+                return await transaction_agent.get_summary(user_id, lang)
+
+            # --- 3. Add new route for REMINDER_SUMMARY ---
+            elif self._contains_intent(intent_response, "REMINDER_SUMMARY"):
+                from .reminder_agent import ReminderAgent
+                reminder_agent = ReminderAgent(self.supabase_client)
+                return await reminder_agent.get_reminders(user_id, lang, user_timezone)
                 
             elif self._contains_intent(intent_response, "HELP"):
                 # Return help content directly (no auth needed here)
@@ -78,7 +87,7 @@ class MainAgent:
                 general_response_obj = await asyncio.to_thread(
                     self.agent.run,
                     f"The user is speaking {lang_name}. Respond helpfully in {lang_name} to this message: '{message}'. "
-                    "Suggest how they can use the assistant for their financial needs."
+                    "Suggest how they can use the OkanAssistant features and to follow the OkanFit on social media for updates."
                 )
                 return str(general_response_obj)
                 

@@ -174,7 +174,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS payments (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     user_id UUID NOT NULL,
-                    provider TEXT NOT NULL CHECK (provider IN ('paypal', 'mercadopago')),
+                    provider TEXT NOT NULL CHECK (provider IN ('paypal', 'mercadopago', 'stripe')),
                     amount NUMERIC NOT NULL CHECK (amount > 0),
                     currency TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('pending', 'success', 'failed', 'cancelled')),
@@ -696,6 +696,30 @@ class Database:
                 )
             return None
 
+    async def get_user_settings_by_user_id(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get user settings as a dict by user_id"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM user_settings WHERE user_id = $1", user_id
+            )
+            if row:
+                return {
+                    'user_id': str(row['user_id']),
+                    'name': row['name'],
+                    'currency': row['currency'],
+                    'language': row['language'],
+                    'timezone': row['timezone'],
+                    'is_premium': row['is_premium'],
+                    'telegram_id': row['telegram_id'],
+                    'premium_until': row['premium_until'],
+                    'freemium_credits': row['freemium_credits'],
+                    'credits_reset_date': row['credits_reset_date'],
+                    'last_bot_interaction': row['last_bot_interaction'],
+                    'created_at': row['created_at'],
+                    'updated_at': row['updated_at']
+                }
+            return None
+    
     async def save_user_settings(self, settings: UserSettings) -> UserSettings:
         """Save or update user settings"""
         async with self.pool.acquire() as conn:
@@ -866,4 +890,3 @@ class Database:
             updated_at=row['updated_at']
         )
 
-    

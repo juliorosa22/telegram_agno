@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles # <-- 1. Import StaticFiles
 from fastapi.templating import Jinja2Templates # <-- 2. Import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+
 from typing import Optional, List, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 import uvicorn
@@ -11,6 +11,7 @@ import os
 import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
+
 
 # Import standardized messages
 from messages import MESSAGES, get_message
@@ -36,6 +37,7 @@ from tools.supabase_tools import SupabaseClient
 from agents.transaction_agent import TransactionAgent
 from agents.reminder_agent import ReminderAgent
 from agents.main_agent import MainAgent
+from agents.timezone_agent import TimezoneAgent # <-- 2. Import the new agent
 from tools.session_manager import SessionManager
 
 # Global services (initialized in lifespan)
@@ -43,12 +45,13 @@ supabase_client = None
 transaction_agent = None
 reminder_agent = None
 main_agent = None
+timezone_agent = None # <-- 3. Add timezone_agent to globals
 session_manager = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown"""
-    global supabase_client, transaction_agent, reminder_agent, main_agent, session_manager
+    global supabase_client, transaction_agent, reminder_agent, main_agent, timezone_agent, session_manager
     
     # Startup
     try:
@@ -68,6 +71,7 @@ async def lifespan(app: FastAPI):
         transaction_agent = TransactionAgent(supabase_client)
         reminder_agent = ReminderAgent(supabase_client)
         main_agent = MainAgent(supabase_client)
+        timezone_agent = TimezoneAgent() # <-- 4. Initialize the timezone agent
         
         # Initialize session manager
         session_manager = SessionManager(session_timeout_minutes=30)
@@ -143,7 +147,7 @@ async def handle_email_confirmation():
     logo_url = "/static/images/okan_assist_upscale.png" 
     download_url = os.getenv("APP_DOWNLOAD_URL", "https://play.google.com/store/apps/details?id=com.okanassist")
 
-    html_content = MESSAGES["registration_html_success"].format(
+    html_content = MESSAGES["en"]["registration_html_success"].format(
         logo_url=logo_url,
         download_url=download_url
     )
@@ -157,51 +161,37 @@ async def handle_start(request: StartRequest):
     try:
         if not main_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
-        user_data = None
-        if not session_manager.is_authenticated(request.user_id):
-            # NEW: Use centralized authentication
-            auth_request = AuthCheckRequest(
-                telegram_id=request.user_id,
-                user_name=request.user_data.get("first_name", None),
-                supabase_user_id=request.args[0] if request.args else None
-            )
-            print(f"🔍 Checking auth for /start: {auth_request.user_name}")
-            auth_result = await check_authentication(auth_request)
-            print(f"🔍 Auth result for /start: {auth_result}")
-            if not auth_result.get("authenticated", False):
-                if auth_result.get("must_register", False):
-                    return {
-                        "success": True,
-                        "message": get_message("welcome_unauthenticated", lang)
-                    }
-                else:
-                    return {
-                        "success": False,
-                        "message": auth_result.get("message", "Authentication failed")
-                    }
         
-
-        user_data = session_manager.get_session(request.user_id)
-
-        # Handle regular /start command
-        try:
-            # User is authenticated - show personalized welcome
-            first_name = user_data.get("first_name", request.user_data.get("first_name", "there"))
-            return {
-                "success": True,
-                "message": get_message("welcome_authenticated", lang, first_name=first_name)
-            }
-            
-        except Exception as e:
-            print(f"❌ Error in regular start: {e}")
-            return {
-                "success": False,
-                "message": "❌ Welcome! There was an issue connecting to the service."
-            }
+        # Use centralized authentication
+        auth_request = AuthCheckRequest(
+            telegram_id=request.user_id,
+            user_name=request.user_data.get("name", None),
+            supabase_user_id=request.args[0] if request.args else None,
+            language=lang,  # Pass language to auth helpers
+            timezone = request.args[2] if len(request.args) > 2 else "UTC", # NEW
+            currency = request.args[3] if len(request.args) > 3 else "USD"  # NEW
+        )
         
+        user_data = await get_user_data(auth_request)
+        
+        # If get_user_data succeeds, the user is authenticated
+        name = user_data.get("name", request.user_data.get("name", "there"))
+        return {
+            "success": True,
+            "message": get_message("welcome_authenticated", lang, name=name)
+        }
+        
+    except HTTPException as e:
+        # Check if this is the specific "must register" exception
+        # For any other authentication or server error, return a failure
+        print(f"HTTPException in handle_start{e.detail}")
+        return {
+            "success": True, # The operation was successful in identifying the user state
+            "message": get_message("welcome_unauthenticated", lang)
+        }
     except Exception as e:
-        print(f"❌ Error in handle_start: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Unhandled Exception in handle_start: {e}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred.")
 
 @app.get("/api/v1/help")
 async def handle_help(language_code: Optional[str] = 'en'):
@@ -234,8 +224,8 @@ async def handle_upgrade(request: UpgradeRequest):
             raise HTTPException(status_code=500, detail="Could not generate payment link.")
 
         # 4. Format the response message for the user
-        message = MESSAGES["upgrade_to_premium"].format(
-            first_name=user_data.get("first_name", "there"),
+        message = get_message("upgrade_to_premium", user_data.get("language", "en"),
+            name=user_data.get("name", "there"),
             stripe_url=payment_details["stripe_url"] # <-- 1. Use stripe_url
         )
         
@@ -252,7 +242,7 @@ async def handle_upgrade(request: UpgradeRequest):
         raise HTTPException(status_code=500, detail="An internal error occurred while processing your upgrade request.")
 
 
-
+# stripe listen --forward-to http://localhost:8000/api/v1/webhooks/stripe
 @app.post("/api/v1/webhooks/stripe")
 async def handle_stripe_webhook(request: Request):
     """Handles incoming webhooks from Stripe to confirm payments."""
@@ -267,18 +257,25 @@ async def handle_stripe_webhook(request: Request):
 
     try:
         # Pass the raw payload and signature header to the handler
-        success = await supabase_client.handle_stripe_webhook(payload, sig_header)
-        
-        if success:
-            # Acknowledged and processed successfully
+        success, telegram_id = await supabase_client.handle_stripe_webhook(payload, sig_header)
+        # ^^^ Modify handle_stripe_webhook to return (success, telegram_id) or None
+
+        if success and telegram_id:
+            # Refresh session for the user
+            user_data = await supabase_client.get_user_by_telegram_id_auth(telegram_id)
+            if user_data:
+                session_manager.create_session(telegram_id, user_data)
+                print(f"✅ Session refreshed for user {telegram_id} after payment.")
+
+            return JSONResponse(content={"status": "success"}, status_code=200)
+        elif success:
+            # No telegram_id found, but processed
             return JSONResponse(content={"status": "success"}, status_code=200)
         else:
-            # Acknowledged but failed to process
             return JSONResponse(content={"status": "failed"}, status_code=400)
 
     except Exception as e:
         print(f"❌ Error processing Stripe webhook: {e}")
-        # Return an error to Stripe so it knows the webhook failed
         return JSONResponse(content={"status": "error"}, status_code=500)
 
 
@@ -334,6 +331,7 @@ async def process_receipt(user_id: str, file: UploadFile = File(...)):
         # Step 1: Get user data using centralized helper
         user_data = await get_user_data(AuthCheckRequest(telegram_id=user_id))
         supabase_id = user_data.get('user_id', None)
+        lang_code = user_data.get('language', 'en')
         # Step 2: Consume credits (since auth is now verified)
         credit_result = await check_and_consume_credits(supabase_id, 'receipt_processing', 5, user_data)
 
@@ -352,7 +350,7 @@ async def process_receipt(user_id: str, file: UploadFile = File(...)):
         # Add credit info to response if not premium
         if not credit_result.get('is_premium', False):
             credits_remaining = credit_result.get('credits_remaining', 0)
-            result += MESSAGES["credits_remaining"].format(credits_remaining=credits_remaining)
+            result += get_message("credits_remaining", lang_code, credits_remaining=credits_remaining)##MESSAGES["credits_remaining"].format(credits_remaining=credits_remaining)
         
         return TransactionResponse(success=True, message=result)
         
@@ -451,66 +449,47 @@ async def get_reminders(user_id: str, limit: int = 10):
         print(f"❌ Unexpected error in get_reminders: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+#TODO improve for currency 
 @app.post("/api/v1/register")
 async def register_user(request: RegisterRequest):
     """Register new user using Supabase Auth"""
+    lang_code = request.language_code
     try:
-        if not supabase_client:
+        if not supabase_client or not timezone_agent:
             raise HTTPException(status_code=503, detail="Service not ready")
-        
-        # Check if telegram_id is already linked
-        existing_user = await supabase_client.get_user_by_telegram_id_auth(request.telegram_id)
-        if existing_user and existing_user.get('authenticated', False):
+        #first verifies if the user is already registered
+        user_data = get_user_data(AuthCheckRequest(telegram_id=request.telegram_id))
+        if user_data:
             return {
                 "success": False, 
-                "message": MESSAGES["telegram_already_registered"].format(email=existing_user.get('email', 'unknown'))
+                "message": get_message("already_registered", lang_code)#MESSAGES["already_registered"]
             }
+        #continue the registration process
+        # --- 1. Use the TimezoneAgent with the correct arguments ---
+        raw_timezone_input = request.timezone
+        # The agent now requires language and returns a tuple: (iana_name, utc_offset)
+        processed_timezone, utc_offset = await timezone_agent.identify_timezone(
+            language=lang_code, 
+            text_input=raw_timezone_input
+        )
+        print(f"Processed timezone: {processed_timezone}, UTC offset: {utc_offset}")
+
         
-        # Check if email already exists in Supabase Auth
-        existing_auth_user = await supabase_client.get_user_by_email_auth(request.email)
-        if existing_auth_user:
-            # Email exists, try to link it to this Telegram account
-            success = await supabase_client.link_telegram_user( 
-                existing_auth_user['user_id'],
-                request.telegram_id,
-                f"{request.first_name} {request.last_name}",
-            )
-            
-            if success:
-                # Create session
-                user_data = {
-                    'user_id': existing_auth_user['user_id'],
-                    'email': request.email,
-                    'first_name': existing_auth_user['user_metadata'].get('first_name', request.first_name),
-                    'last_name': existing_auth_user['user_metadata'].get('last_name', request.last_name),
-                    'currency': 'USD',
-                    'language': request.language_code,
-                    'timezone': 'UTC',
-                    'is_premium': False,
-                    'premium_until': None,
-                    'telegram_id': request.telegram_id,
-                    'authenticated': True
-                }
-                session_manager.create_session(request.telegram_id, user_data)
-                
-                return {
-                    "success": True,
-                    "message": MESSAGES["link_success"].format(first_name=request.first_name),
-                    "user_data": user_data
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": MESSAGES["link_failed"]
-                }
+        # --- 2. Validate the agent's output and default to 'UTC' on failure ---
+        if not processed_timezone:
+            print(f"⚠️ Timezone identification failed for input '{raw_timezone_input}'. Defaulting to UTC.")
+            processed_timezone = "UTC"
+        # Infer currency
+        inferred_currency = infer_currency(processed_timezone)
+        print(f"Inferred currency: {inferred_currency}")
+        # --- (The rest of the function proceeds, using `processed_timezone` for storage) ---
         
         # Create new user in Supabase Auth
         auth_result = await supabase_client.sign_up_user_with_auth(
             email=request.email,
             password=None,  # Will generate random password
             user_metadata={
-                'first_name': request.first_name,
-                'last_name': request.last_name,
+                'name': request.name,
                 'telegram_id': request.telegram_id,
                 'language_code': request.language_code,
                 'registration_source': 'telegram_bot'
@@ -520,28 +499,30 @@ async def register_user(request: RegisterRequest):
         if not auth_result['success']:
             return {
                 "success": False,
-                "message": MESSAGES["registration_failed"].format(message=auth_result['message'])
+                "message": get_message("registration_failed", lang_code, message=auth_result['message'])
             }
         
-        # Link Telegram ID to the new auth user
-        success = await supabase_client.link_telegram_user(
+
+        # Create user settings in the database and already link telegram_id
+        result=await supabase_client.create_new_user_settings(
             auth_result['user_id'],
-            request.telegram_id,
-            f"{request.first_name} {request.last_name}"
+            {   'name': request.name,
+                'telegram_id': request.telegram_id,
+                'language': request.language_code,
+                'timezone': processed_timezone,
+                'currency': inferred_currency
+            }
         )
 
-               
-        
-        if success.get("success"):
+        if result.get("success"):
             # Create session
             user_data = {
                 'user_id': auth_result['user_id'],
                 'email': request.email,
-                'first_name': request.first_name,
-                'last_name': request.last_name,
-                'currency': 'USD',
+                'name': request.name,
+                'currency': inferred_currency,
                 'language': request.language_code,
-                'timezone': 'UTC',
+                'timezone': processed_timezone, # Use processed IANA name
                 'is_premium': False,
                 'premium_until': None,
                 'telegram_id': request.telegram_id,
@@ -551,17 +532,18 @@ async def register_user(request: RegisterRequest):
             
             return {
                 "success": True,
-                "message": MESSAGES["registration_success"].format(first_name=request.first_name),
+                "message": get_message("registration_success", lang_code, name=request.name, password=auth_result['password'], download_url=os.getenv("APP_DOWNLOAD_URL", "https://play.google.com/store/apps/details?id=com.okanassist")),
                 "user_data": user_data
             }
         else:
             return {
                 "success": False,
-                "message": MESSAGES["registration_linking_failed"]
+                "message": get_message("registration_linking_failed", lang_code)
             }
-            
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"❌ Registration error: {e}")
+        print(f"❌ Registration error API register_user: error aqui {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -574,18 +556,10 @@ async def get_profile(user_id: str):
         # Step 1: Get user data using centralized helper
         user_data = await get_user_data(AuthCheckRequest(telegram_id=user_id))
         
-        # Step 2: Format and return profile (no credits needed)
-        profile_message = (
-            f"👤 *Your Profile*\n\n"
-            f"📧 Email: {user_data.get('email', 'Not set')}\n"
-            f"👤 Name: {user_data.get('first_name', 'Unknown')} {user_data.get('last_name', '')}\n"
-            f"🌐 Language: {user_data.get('language', 'en')}\n"
-            f"💰 Currency: {user_data.get('currency', 'USD')}\n"
-            f"⏰ Timezone: {user_data.get('timezone', 'UTC')}\n"
-            f"⭐ Premium: {'Yes' if user_data.get('is_premium') else 'No'}\n"
-        )
-        
-        return {"success": True, "message": profile_message}
+        # --- FIX: Return the raw user_data dictionary ---
+        # The bot handler will be responsible for formatting.
+        return {"success": True, "user_data": user_data}
+
     except HTTPException:
         # ✅ Re-raise HTTPExceptions (401, 503, etc.)
         raise
@@ -613,118 +587,89 @@ async def health_check():
 ##### HELPER FUNCTIONS #####
 # Centralized authentication function
 async def check_authentication(request: AuthCheckRequest) -> Dict[str, Any]:
-    """Centralized user authentication flow"""
+    """
+    Centralized user authentication flow.
+    Returns user_data on success, raises HTTPException on failure.
+    """
+    lang_code = request.language
     try:
         # First, check if the telegram_id is linked to a supabase user
         user_data = await supabase_client.get_user_by_telegram_id_auth(request.telegram_id)
-        #print(f"🔍 Initial user_data in check_authentication: {user_data}")
-        if user_data is None:
-            # No linked telegram user
-            if request.supabase_user_id:
-                
-                print("Trying to link:",request)
-                # Try to authenticate from database via Supabase Auth
-                # Verify the Supabase ID exists in the auth table and try to link
-                # Here the link still might fail if the supabase_user_id is invalid
-                result = await supabase_client.link_telegram_user(request.supabase_user_id, request.telegram_id, request.user_name)
-                if result.get("success"):
-                    user_data = await supabase_client.get_user_by_telegram_id_auth(request.telegram_id)
-                    is_authenticated = user_data.get("authenticated", False) if user_data else False
-                    if is_authenticated and user_data:
-                        # Validate and complete user_data if needed
-                        user_data = await _validate_and_complete_user_data(user_data, request.telegram_id)
-                        # Create session
-                        session_manager.create_session(request.telegram_id, user_data)
-                    return {
-                        "success": is_authenticated,
-                        "authenticated": is_authenticated,
-                        "user_data": user_data if is_authenticated else None,
-                        "message": MESSAGES["link_success"].format(first_name=user_data.get("name", "there") if is_authenticated else MESSAGES["failed_retrieve_user_data"])
-                    }
-                else:
-                    # Linking failed
-                    return {
-                        "success": False,
-                        "authenticated": False,
-                        "user_data": None,
-                        "message": MESSAGES["link_failed"]
-                    }
-            else:# First time user - not linked and no supabase_user_id provided
-                #Means user doesnt have installed the app nor have registered
-                # No supabase_user_id provided, cannot link
-                # This means the user is not registered
-                print(f"⚠️ User {request.telegram_id} not registered and no supabase_user_id provided")
-                return {
-                    "success": False,
-                    "authenticated": False,
-                    "user_data": None,
-                    "must_register": True,
-                    "message": MESSAGES["user_not_registered"]
-                }
-        else:
-            # User is already linked - check if authenticated and data is complete
-            is_authenticated = user_data.get("authenticated", False)
-            if is_authenticated:
-                # Validate and complete user_data
-                user_data = await _validate_and_complete_user_data(user_data, request.telegram_id)
-                session_manager.create_session(request.telegram_id, user_data)
-                return {
-                    "success": True,
-                    "authenticated": True,
-                    "user_data": user_data
-                }
-            else:
-                # User data exists but not authenticated (edge case)
-                return {
-                    "success": False,
-                    "authenticated": False,
-                    "user_data": None,
-                    "message": "User data found but not authenticated"
-                }
-    except Exception as e:
-        print(f"❌ Error in check_authentication: {e}")
-        return {
-            "success": False,
-            "authenticated": False,
-            "user_data": None,
-            "message": "Authentication check failed"
-        }
+        if user_data:
+            print(f"🔍 Found linked user for telegram_id {request.telegram_id}")
+            return await _validate_and_complete_user_data(user_data, request.telegram_id)
 
-# Wrap the session manager access in a try-except to avoid crashes and uses the check_authentication function
+        # If not found, try to link if supabase_user_id is provided
+        if request.supabase_user_id:
+            print("Trying to link:", request)
+            try:
+                result = await supabase_client.link_telegram_user(
+                    request.supabase_user_id, 
+                    request.telegram_id, 
+                )
+                if result.get("success"):
+                    # After successful link, fetch the complete user data again
+                    user_data = await supabase_client.get_user_by_telegram_id_auth(request.telegram_id)
+                    if user_data:
+                        return await _validate_and_complete_user_data(user_data, request.telegram_id)
+                
+                # If linking or re-fetching fails, raise an exception
+                raise HTTPException(status_code=401, detail=get_message("link_failed", lang_code))
+
+            except Exception as e:
+                print(f"❌ Error linking user in check_authentication: {e}")
+                raise HTTPException(status_code=401, detail=get_message("link_failed", lang_code))
+        
+        # If no user found and no supabase_user_id to link, they must register
+        else:
+            print(f"⚠️ User {request.telegram_id} not registered.")
+            raise HTTPException(status_code=401, detail=get_message("user_not_registered", lang_code))
+
+    except HTTPException:
+        raise # Re-raise known HTTP exceptions
+    except Exception as e:
+        print(f"❌ Uncaught error in check_authentication: {e}")
+        raise HTTPException(status_code=500, detail="An error occurred during authentication.")
+
+
+# Wrap the session manager access and use the exception-based check_authentication
 async def get_user_data(auth_request: AuthCheckRequest) -> Dict[str, Any]:
-    """Helper to get user data from session or database with fallback to authentication"""
+    """
+    Helper to get user data from session or database.
+    Handles authentication and session creation.
+    """
     try:
+        # 1. Check for a valid and complete session first
         if session_manager.is_authenticated(auth_request.telegram_id):
             session = session_manager.get_session(auth_request.telegram_id)
             if session and _is_user_data_complete(session):
                 print(f"✅ Retrieved complete user data from session for {auth_request.telegram_id}")
                 return session
-            else:
-                # Session authenticated but data missing or incomplete - re-authenticate
-                print(f"⚠️ Session authenticated but data incomplete for {auth_request.telegram_id} - re-authenticating")
-                auth_result = await check_authentication(auth_request)
-                if auth_result.get("authenticated", False):
-                    return auth_result["user_data"]
-                else:
-                    raise HTTPException(status_code=401, detail=auth_result.get("message", "Authentication failed"))
-        else:
-            # Not authenticated - perform authentication
-            print("🔍 No valid session - performing authentication")
-            auth_result = await check_authentication(auth_request)
-            if auth_result.get("authenticated", False):
-                return auth_result["user_data"]
-            else:
-                raise HTTPException(status_code=401, detail=auth_result.get("message", "Authentication failed"))
-    except HTTPException:
+        
+        # 2. If no valid session, perform full authentication
+        print(f"🔍 No valid session for {auth_request.telegram_id} - performing full authentication.")
+        user_data = await check_authentication(auth_request)
+        
+        # 3. On successful authentication, create a new session
+        session_manager.create_session(auth_request.telegram_id, user_data)
+        print(f"✅ Session created for {auth_request.telegram_id}")
+        
+        return user_data
+
+    except HTTPException as e:
+        # Log and re-raise HTTP exceptions from check_authentication
+        print(f"❌ Authentication failed for {auth_request.telegram_id}: {e.detail}")
         raise
     except Exception as e:
-        print(f"❌ Error in get_user_data: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        # Catch any other unexpected errors
+        print(f"❌ Unexpected error in get_user_data: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error during data retrieval.")
+
 
 # Helper function to validate and complete user data
 async def _validate_and_complete_user_data(user_data: Dict[str, Any], telegram_id: str) -> Dict[str, Any]:
     """Validate user data completeness and fill in missing fields if possible"""
-    required_fields = ['user_id', 'email', 'first_name', 'authenticated']
+    required_fields = ['user_id', 'email', 'name', 'authenticated']
     
     # Check if all required fields are present and non-empty
     for field in required_fields:
@@ -736,8 +681,8 @@ async def _validate_and_complete_user_data(user_data: Dict[str, Any], telegram_i
                     auth_user = await supabase_client.supabase.auth.admin.get_user_by_id(user_data['user_id'])
                     if auth_user.user:
                         user_data['email'] = auth_user.user.email or user_data.get('email', '')
-                        user_data['first_name'] = auth_user.user.user_metadata.get('first_name', user_data.get('first_name', 'Unknown'))
-                        user_data['last_name'] = auth_user.user.user_metadata.get('last_name', user_data.get('last_name', ''))
+                        user_data['name'] = auth_user.user.user_metadata.get('name', user_data.get('name', 'Unknown'))
+                        #user_data['last_name'] = auth_user.user.user_metadata.get('last_name', user_data.get('last_name', ''))
                         user_data['authenticated'] = True
                         print(f"✅ Completed user data for {telegram_id}")
                 except Exception as e:
@@ -749,7 +694,7 @@ async def _validate_and_complete_user_data(user_data: Dict[str, Any], telegram_i
 # Helper function to check if user data is complete
 def _is_user_data_complete(user_data: Dict[str, Any]) -> bool:
     """Check if user data has all required fields"""
-    required_fields = ['user_id', 'email', 'first_name', 'authenticated']
+    required_fields = ['user_id', 'email', 'name', 'authenticated']
     return all(user_data.get(field) for field in required_fields)
 
 
@@ -785,6 +730,43 @@ async def check_and_consume_credits(user_id: str, operation_type: str, credits_n
     return result
 
 
+def infer_currency(timezone: str) -> str:
+    """Infer currency code from timezone (basic mapping, can be expanded)."""
+    # Simple mapping for common timezones
+    timezone_currency_map = {
+        "America/Sao_Paulo": "BRL",
+        "America/New_York": "USD",
+        "America/Los_Angeles": "USD",
+        "Europe/London": "GBP",
+        "Europe/Madrid": "EUR",
+        "Europe/Paris": "EUR",
+        "Europe/Berlin": "EUR",
+        "Asia/Tokyo": "JPY",
+        "Asia/Shanghai": "CNY",
+        "Asia/Kolkata": "INR",
+        "Australia/Sydney": "AUD",
+        "Africa/Johannesburg": "ZAR",
+        "UTC": "USD",  # Default fallback
+    }
+    # Try exact match
+    currency = timezone_currency_map.get(timezone)
+    if currency:
+        return currency
+    # Fallback: infer from continent
+    if timezone.startswith("America/"):
+        return "USD"
+    elif timezone.startswith("Europe/"):
+        return "EUR"
+    elif timezone.startswith("Asia/"):
+        return "USD"  # Could be improved with more granular mapping
+    elif timezone.startswith("Australia/"):
+        return "AUD"
+    elif timezone.startswith("Africa/"):
+        return "USD"  # Could be improved
+    return "USD"  # Default fallback
+
+
+
 def run_api():
     """Run the API server"""
     uvicorn.run(
@@ -796,3 +778,4 @@ def run_api():
 
 if __name__ == "__main__":
     run_api()
+

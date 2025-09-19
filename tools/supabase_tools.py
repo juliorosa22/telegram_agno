@@ -1,6 +1,6 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from .database import Database
-from .models import Transaction, Reminder, TransactionType, ReminderType, Priority
+from .models import Transaction, Reminder, TransactionType, ReminderType, Priority, UserSettings
 from datetime import datetime, timedelta
 import os
 from supabase import create_client, Client
@@ -132,26 +132,23 @@ class SupabaseClient:
             return {"success": False, "message": "❌ Internal error. Please try again later."}
 
     #adjust this function to also get the user name and insert it into the database
-    async def link_telegram_user(self, supabase_user_id: str, telegram_id: str, user_name: str ):
-        """Link a Telegram user to a Supabase user"""
+    async def link_telegram_user(self, supabase_user_id: str, telegram_id: str) -> Dict[str, Any]:
+        """Link a Telegram user to a Supabase user in user_settings."""
         try:
             if not self.connected:
                 await self.connect()
-            
-            # Update user_settings with telegram_id
+            print(f"Linking Telegram {telegram_id} to Supabase {supabase_user_id}")
+
             async with self.database.pool.acquire() as conn:
                 await conn.execute("""
-                    INSERT INTO user_settings (user_id, telegram_id, name, last_bot_interaction)
-                    VALUES ($1, $2, $3, NOW())
+                    INSERT INTO user_settings (user_id, telegram_id, last_bot_interaction)
+                    VALUES ($1, $2, NOW())
                     ON CONFLICT (user_id) DO UPDATE SET
-                        telegram_id = $2,
-                        name = $3,
+                        telegram_id = EXCLUDED.telegram_id,
                         last_bot_interaction = NOW(),
                         updated_at = NOW()
-                """, supabase_user_id, telegram_id, user_name)
-            print(f"inserted {user_name}")
+                """, supabase_user_id, telegram_id)
             return {"success": True, "message": f"✅ Linked Telegram user {telegram_id} to Supabase user {supabase_user_id}"}
-    
         except Exception as e:
             print(f"❌ Error linking Telegram user: {e}")
             raise
@@ -245,7 +242,7 @@ class SupabaseClient:
             payment_id = await self.database.create_payment(
                 user_id=user_id,
                 provider="stripe", # Set provider to stripe
-                amount=5.99, # Your standard price
+                amount=4.99, # Your standard price
                 currency=currency
             )
 
@@ -255,6 +252,7 @@ class SupabaseClient:
             # 2. Create a Stripe Checkout Session
             price_id = os.getenv("STRIPE_PRICE_ID")
             bot_username = os.getenv("TELEGRAM_BOT_USERNAME", "")
+            print("bot_username", bot_username)
             success_url = f"https://t.me/{bot_username}?start=payment_success"
             cancel_url = f"https://t.me/{bot_username}?start=payment_cancelled"
 
@@ -278,12 +276,12 @@ class SupabaseClient:
 
 
     
-    async def handle_stripe_webhook(self, payload: bytes, sig_header: str) -> bool:
+    async def handle_stripe_webhook(self, payload: bytes, sig_header: str) -> Tuple[bool, Optional[str]]:
         """Handle Stripe payment webhook"""
         webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
         if not webhook_secret:
             print("❌ Stripe webhook secret is not configured.")
-            return False
+            return False, None
 
         try:
             event = stripe.Webhook.construct_event(
@@ -292,11 +290,11 @@ class SupabaseClient:
         except ValueError as e:
             # Invalid payload
             print(f"❌ Invalid webhook payload: {e}")
-            return False
+            return False, None
         except stripe.error.SignatureVerificationError as e:
             # Invalid signature
             print(f"❌ Invalid webhook signature: {e}")
-            return False
+            return False, None
 
         # Handle the checkout.session.completed event
         if event['type'] == 'checkout.session.completed':
@@ -309,18 +307,26 @@ class SupabaseClient:
 
             if not payment_id:
                 print("❌ Webhook received without a client_reference_id (payment_id).")
-                return False
+                return False, None
 
             print(f"✅ checkout.session.completed for payment_id: {payment_id}")
             
             # Update our database
             await self.process_payment_success(payment_id, customer_id, subscription_id)
-            return True
+            
+            # Find the payment record and get the user_id, then fetch telegram_id
+            payment_record = await self.database.get_payment_by_id(payment_id)
+            user_id = payment_record.get("user_id")
+            user_settings = await self.database.get_user_settings_by_user_id(user_id)
+            telegram_id = user_settings.get("telegram_id")
+            
+            # Return both success and telegram_id
+            return True, telegram_id
             
         else:
             print(f"ℹ️ Received unhandled Stripe event type: {event['type']}")
-            return True # Return True to acknowledge receipt of the event
-        return False
+            return True, None # Return True to acknowledge receipt of the event
+        return False, None
     
     async def sign_up_user_with_auth(self, email: str, password: str, user_metadata: Dict[str, Any] = None) -> Dict[str, Any]:
         """Sign up user with Supabase Auth"""
@@ -332,6 +338,7 @@ class SupabaseClient:
             
             response = self.supabase.auth.sign_up({
                 "email": email,
+                "display_name": user_metadata.get("name") if user_metadata else None,
                 "password": password,
                 "options": {
                     "data": user_metadata or {}
@@ -343,6 +350,7 @@ class SupabaseClient:
                     "success": True,
                     "user_id": response.user.id,
                     "email": response.user.email,
+                    "password": password,  # Return generated password if applicable
                     "user_metadata": response.user.user_metadata,
                     "message": "User created successfully"
                 }
@@ -431,7 +439,7 @@ class SupabaseClient:
                         return {
                             'user_id': auth_user_id,
                             'email': auth_response.user.email,
-                            'first_name': auth_response.user.user_metadata.get('name'),
+                            'name': auth_response.user.user_metadata.get('name'),
                             'currency': user_row['currency'],
                             'language': user_row['language'],
                             'timezone': user_row['timezone'],
@@ -447,7 +455,7 @@ class SupabaseClient:
                     return {
                         'user_id': auth_user_id,
                         'email': None,
-                        'first_name': None,
+                        'name': None,
                         'currency': user_row['currency'],
                         'language': user_row['language'],
                         'timezone': user_row['timezone'],
@@ -463,6 +471,22 @@ class SupabaseClient:
         except Exception as e:
             print(f"❌ Error getting user by telegram ID: {e}")
             return None
+
+    async def create_new_user_settings(self, auth_user_id: str, user_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        new_user_data = UserSettings(
+            user_id=auth_user_id,
+            name=user_data.get('name'),
+            currency=user_data.get('currency'),
+            language=user_data.get('language'),
+            timezone=user_data.get('timezone'),
+            telegram_id=user_data.get('telegram_id'),
+        )
+        try:
+           await self.database.save_user_settings(new_user_data)
+           return {'success': True, 'user_data': new_user_data}
+        except Exception as e:
+            print(f"❌ Error creating new user settings: {e}")
+            raise
 
     # Update ensure_user_exists method to work with auth
     async def ensure_user_exists_auth(self, telegram_id: str, user_data: dict):
